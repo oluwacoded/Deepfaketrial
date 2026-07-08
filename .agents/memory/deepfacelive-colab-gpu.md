@@ -83,3 +83,19 @@ serves the full UI while its buttons 404 silently.
 notebook and the Replit workflow) must carry BOTH deploy-clean's features AND the GPU fallback.
 When switching or merging branches, diff the frontend's `fetch()` paths against the backend
 routes (`grep -nE "@app.route|@socketio.on"`) to confirm parity before shipping.
+
+## "On the GPU but laggy" = ONNX Runtime silently ran on CPU
+onnxruntime can register a session on CPU even when you asked for a GPU EP: if the CUDA
+EP fails to init it silently drops CUDA and keeps CPU, with NO exception. If the app
+infers the device from HOST capability ("a GPU exists → report gpu"), the status LIES —
+it claims GPU while inference crawls on CPU. That is the usual cause of "I'm on GPU but
+it lags like a fool".
+**Truth source:** `sess.get_providers()` on the ACTUAL InferenceSession — check for
+`CUDAExecutionProvider`/`DmlExecutionProvider`. Record it per session (detector AND
+model separately) and report THAT in status, not the host guess.
+**Make the reason visible:** the code sets `sess_options.log_severity_level = 4`
+(fatal-only), which HIDES onnxruntime's "falling back to CPU" warning. For GPU EPs lower
+it to 2 (warning) so the cause (CUDA/cuDNN mismatch, missing lib) shows in the Colab
+console; keep CPU sessions quiet at 4.
+**Why:** it's a debugging trap — the swap still "works" and the banner says GPU, so you
+chase the wrong thing. Trust get_providers(), not intent.

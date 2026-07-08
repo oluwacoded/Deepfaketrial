@@ -3,3 +3,5 @@
 - [DeepFaceLive Colab GPU + branch parity](deepfacelive-colab-gpu.md) — smooth path = slim colab-gpu branch on free Colab GPU; GPU auto-detect + CPU fallback; deploy-clean holds the complete backend colab-gpu must carry.
 - [DeepFaceLive access gate](deepfacelive-access-gate.md) — paywall active only when DATABASE_URL set; keep /call + WebRTC signaling public; gate the `frame` socket event (not connect) for paid compute.
 - [DeepFaceLive OpenCV system libs](deepfacelive-opencv-system-libs.md) — cv2 import dies after an env reboot (libxcb/libGL/glib); restore via installSystemDependencies + commit replit.nix.
+- [DeepFaceLive DFM swap quality](deepfacelive-swap-quality.md) — "melted clown" = wide face_coverage starves the fixed 224px model; tighten coverage (~1.5) + LANCZOS + unsharp.
+- [DeepFaceLive silent CPU fallback](deepfacelive-colab-gpu.md) — "on GPU but laggy" often = ORT silently ran on CPU; trust sess.get_providers() not host guess; log_severity=4 hides the reason.
