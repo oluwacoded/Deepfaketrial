@@ -83,6 +83,8 @@ def init_db():
                 note         TEXT
             )
         """)
+        # A code locks to the first device that redeems it (anti-sharing).
+        con.run("ALTER TABLE access_codes ADD COLUMN IF NOT EXISTS bound_device VARCHAR(64)")
         con.run("""
             CREATE TABLE IF NOT EXISTS bot_admins (
                 chat_id  BIGINT PRIMARY KEY,
@@ -125,29 +127,49 @@ def generate_code(tier, created_by=None, note=None):
         con.close()
 
 
-def redeem(code):
-    """Validate a code. Activates it (sets expiry) on first use.
+def redeem(code, device_id=None):
+    """Validate a code and bind it to the first device that uses it.
+
+    On first use the code is activated (expiry set) and locked to ``device_id``.
+    Afterwards ONLY that same device may redeem it again — any other device is
+    rejected with reason ``in_use`` (stops a buyer sharing one code around).
 
     Returns {'ok': True, 'tier': ..., 'expires_at': datetime} or
-            {'ok': False, 'reason': 'invalid'|'expired'|'revoked'|'empty'}.
+            {'ok': False, 'reason': 'invalid'|'expired'|'revoked'|'in_use'|'empty'}.
     """
     code = (code or '').strip().upper()
     if not code:
         return {'ok': False, 'reason': 'empty'}
+    device_id = (device_id or '').strip() or None
     con = _connect()
     try:
-        rows = con.run("SELECT tier, status, expires_at FROM access_codes WHERE code = :c", c=code)
+        rows = con.run("SELECT tier, status, expires_at, bound_device "
+                       "FROM access_codes WHERE code = :c", c=code)
         if not rows:
             return {'ok': False, 'reason': 'invalid'}
-        tier, status, expires_at = rows[0]
+        tier, status, expires_at, bound_device = rows[0]
         now = datetime.now(timezone.utc)
         if status == 'revoked':
             return {'ok': False, 'reason': 'revoked'}
+
         if status == 'unused':
+            # First use: activate AND lock to this device. The WHERE status guard
+            # + RETURNING makes this atomic — if two devices race on a fresh code
+            # only one UPDATE matches; the loser falls through to the binding
+            # check below and is rejected.
             exp = now + timedelta(days=TIERS.get(tier, {}).get('days', 7))
-            con.run("UPDATE access_codes SET status='active', activated_at=:a, expires_at=:e WHERE code=:c",
-                    a=now, e=exp, c=code)
-            return {'ok': True, 'tier': tier, 'expires_at': exp}
+            won = con.run("UPDATE access_codes SET status='active', activated_at=:a, "
+                          "expires_at=:e, bound_device=:d "
+                          "WHERE code=:c AND status='unused' RETURNING id",
+                          a=now, e=exp, d=device_id, c=code)
+            if won:
+                return {'ok': True, 'tier': tier, 'expires_at': exp}
+            rows = con.run("SELECT tier, status, expires_at, bound_device "
+                           "FROM access_codes WHERE code = :c", c=code)
+            if not rows:
+                return {'ok': False, 'reason': 'invalid'}
+            tier, status, expires_at, bound_device = rows[0]
+
         # already active — must carry a real expiry to be usable
         if expires_at is None:
             return {'ok': False, 'reason': 'invalid'}
@@ -156,6 +178,20 @@ def redeem(code):
         if expires_at <= now:
             con.run("UPDATE access_codes SET status='expired' WHERE code=:c", c=code)
             return {'ok': False, 'reason': 'expired'}
+        # Single-device enforcement.
+        if bound_device:
+            if device_id != bound_device:
+                return {'ok': False, 'reason': 'in_use'}
+        else:
+            # legacy code activated before binding existed — bind it now, but do
+            # so atomically so a race can't bind two devices at once.
+            bound = con.run("UPDATE access_codes SET bound_device=:d "
+                            "WHERE code=:c AND bound_device IS NULL RETURNING id",
+                            d=device_id, c=code)
+            if not bound:
+                rows2 = con.run("SELECT bound_device FROM access_codes WHERE code=:c", c=code)
+                if rows2 and rows2[0][0] and rows2[0][0] != device_id:
+                    return {'ok': False, 'reason': 'in_use'}
         return {'ok': True, 'tier': tier, 'expires_at': expires_at}
     finally:
         con.close()

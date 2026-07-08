@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -117,18 +118,35 @@ def login():
     if not auth.enabled():
         return redirect(url_for('index'))
     code = (request.form.get('code') or '').strip()
-    res = auth.redeem(code)
+    # Stable per-browser id: a code locks to the FIRST device that redeems it.
+    # Accept an existing cookie only if it looks like one we issued (32 hex
+    # chars); otherwise mint a fresh id so a malformed/injected value never
+    # reaches the DB.
+    device_id = request.cookies.get('tmfg_device') or ''
+    if not re.fullmatch(r'[0-9a-f]{32}', device_id):
+        device_id = secrets.token_hex(16)
+    res = auth.redeem(code, device_id)
     if res.get('ok'):
         exp = res['expires_at']
         session.permanent = True
         session['access_code'] = code.upper()
         session['access_tier'] = res['tier']
         session['access_exp'] = exp.timestamp() if hasattr(exp, 'timestamp') else float(exp)
-        return redirect(url_for('index'))
+        resp = redirect(url_for('index'))
+        # Mark the cookie Secure when the browser reached us over HTTPS (the
+        # Replit proxy sets X-Forwarded-Proto); left off for plain-http local
+        # dev so testing still works.
+        xfp = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip()
+        secure = request.is_secure or xfp == 'https'
+        resp.set_cookie('tmfg_device', device_id, max_age=400 * 24 * 3600,
+                        httponly=True, samesite='Lax', secure=secure)
+        return resp
     reasons = {
         'invalid': 'That access code is not valid.',
         'expired': 'That access code has expired.',
         'revoked': 'That access code has been revoked.',
+        'in_use': 'This code is already in use on another device. '
+                  'Each code works on one device only.',
         'empty': 'Please enter your access code.',
     }
     return render_template('landing.html', tiers=auth.TIERS_LIST, pay=PAYMENT_INFO,
