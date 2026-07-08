@@ -9,6 +9,15 @@ The web face-swap is CPU-bound on Replit (DFM `convert()` ~325ms → laggy). To 
 smooth, run the whole app on Google Colab's free T4 GPU (convert ~15ms). The phone→server
 network hop stays; the GPU removes the compute bottleneck.
 
+## "Still looks like a clown / lags like mad" — triage the URL FIRST
+Before re-debugging the swap engine, confirm the user is on the COLAB (GPU) link, not the
+Replit (CPU) site — the SAME code runs on both and only Colab is smooth. The engine (GPU
+auto-detect + the swap-quality/clown fix) can already be correct AND pushed; the usual real
+gap is the user testing the CPU host, or their Colab cloning stale pre-push code. Fix: push
+the current `colab-gpu` so the one-click link serves latest, then have them run the Colab
+link (not Replit). Only dig into pipeline/quality after confirming they're actually on GPU
+(get_providers() shows CUDA), not silently on CPU.
+
 ## Device auto-detect + graceful fallback (both components)
 - The pipeline picks the device at runtime: prefers a non-CPU ORT device (CUDA) when
   present, honors `FORCE_CPU=1`, else CPU. Harmless on Replit (stays CPU).
