@@ -41,3 +41,14 @@ description: Why the subscription paywall is conditional and what must stay publ
   **Why:** the seller required that a code can't be re-redeemed/shared by others.
   **How to apply:** the buyer on a brand-new device or after clearing cookies
   needs a NEW code (issue via the bot) — this is intended, not a bug.
+
+- Issue the `tmfg_device` cookie on the LANDING PAGE GET (before any redeem), then
+  reuse that id in the login POST. Do NOT mint+bind the device id inside the redeem
+  POST: binding a code to an id the browser hasn't stored yet means a dropped
+  response, a cookie-blocking browser, or a double-tapped "Log in" locks the code
+  as `in_use` forever (the "codes get eaten" bug).
+  **Why:** first-redeem activates AND binds atomically; if the client never keeps
+  that id, no later request can match it and the paid code is dead with no recovery.
+  **How to apply:** set the cookie when rendering the login page; at redeem reuse
+  the existing cookie and only mint as a last resort. Same-device re-redeem is
+  idempotent (returns ok), so double-submits are safe.

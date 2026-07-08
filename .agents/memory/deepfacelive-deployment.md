@@ -49,3 +49,29 @@ and inject $PORT; a hardcoded port means the edge proxy can't connect and the UR
 times out (Railway "Application Failed to Respond" / 502). The 5000 fallback keeps Replit
 and the Colab clone working (they leave $PORT unset). On Railway, set a service variable
 `PORT=8080` to match the generated domain's target port.
+Replit VM caveat: with `[[ports]]` in .replit (localPort=5000/externalPort=80), auto port
+detection is OFF and the app MUST listen on localPort 5000 — `os.environ.get('PORT',5000)`
+resolves to 5000 there, so it's correct AND still portable to Railway.
+
+## Serve a 200 on "/" for the VM healthcheck — don't rely on a redirect passing
+The Reserved VM deploy healthchecks `GET /` and TERMINATES the deploy if it stays
+unhealthy (a published build that returned 500 on `/` was killed in a restart loop).
+A 302 redirect on `/` is NOT confirmed to count as healthy (docs don't specify redirect
+handling). Safest: serve a real 200 on `/` for unauthenticated visitors — render the
+landing/login page there and gate the actual app behind the session — so the healthcheck
+always sees a 2xx. Keep templates OUT of .replitignore or the `/`→landing render 500s in prod.
+
+## Dev and production are SEPARATE databases — gate the code bot to prod only
+Replit's dev DB and the published app's DB are DIFFERENT (prod schema syncs at Publish).
+Any background worker that WRITES (here: the Telegram code bot) fills whichever DB its
+process is connected to. If the bot runs in the dev workflow it fills the DEV db, but the
+published app validates codes against the PROD db → every code reads "invalid" and the prod
+`access_codes`/`bot_admins` tables stay empty.
+**Why:** confirmed by inspecting both DBs — the code-generating bot had been writing to the
+DEV db while the live (prod) app read an empty prod db, so every code showed "invalid".
+**How to apply:** only spawn the bot when `REPLIT_DEPLOYMENT` is set (or `RUN_TELEGRAM_BOT=1`
+for a non-Replit host / local test), so it writes to the same DB the live app reads. Also:
+admins/codes made in dev do NOT exist in prod — after the first publish, re-run
+`/auth <passphrase>` against the live bot to become admin in the prod db, then `/gen`.
+Telegram allows ONE poller per token, so the dev bot must be off (restart dev after gating)
+or it steals the token and writes to the wrong DB.

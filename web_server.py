@@ -27,8 +27,8 @@ import numpy as np
 
 from datetime import timedelta
 
-from flask import (Flask, jsonify, redirect, render_template, request,
-                   send_file, session, url_for)
+from flask import (Flask, jsonify, make_response, redirect, render_template,
+                   request, send_file, session, url_for)
 from flask_socketio import SocketIO, emit, join_room
 from werkzeug.utils import secure_filename
 
@@ -93,7 +93,7 @@ PAYMENT_INFO = {
 }
 
 _PUBLIC_PREFIXES = ('/static/', '/call/', '/api/room/', '/socket.io')
-_PUBLIC_PATHS = {'/welcome', '/login', '/logout', '/favicon.ico'}
+_PUBLIC_PATHS = {'/', '/welcome', '/login', '/logout', '/favicon.ico'}
 
 
 def _session_valid():
@@ -119,12 +119,43 @@ def _access_gate():
     return redirect(url_for('welcome'))
 
 
+def _read_device_id():
+    """Return the browser's existing device id only if it looks like one we
+    issued (32 hex chars); otherwise None."""
+    d = request.cookies.get('tmfg_device') or ''
+    return d if re.fullmatch(r'[0-9a-f]{32}', d) else None
+
+
+def _set_device_cookie(resp, device_id):
+    # Mark the cookie Secure when the browser reached us over HTTPS (the Replit
+    # proxy sets X-Forwarded-Proto); left off for plain-http local dev so
+    # testing still works.
+    xfp = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip()
+    secure = request.is_secure or xfp == 'https'
+    resp.set_cookie('tmfg_device', device_id, max_age=400 * 24 * 3600,
+                    httponly=True, samesite='Lax', secure=secure)
+    return resp
+
+
+def _landing(error=None, status=200):
+    """Render the access-code landing page and, crucially, hand the browser its
+    device id BEFORE it ever redeems a code. A code binds to the first device
+    that redeems it; if that id were minted only during the login POST, a dropped
+    response, a blocked cookie, or a double-tapped submit could bind the code to
+    an id the browser never keeps — locking the code as "in use" forever. Issuing
+    it here means the id is already accepted by the time a code is redeemed."""
+    resp = make_response(render_template('landing.html', tiers=auth.TIERS_LIST,
+                                         pay=PAYMENT_INFO, error=error), status)
+    if not _read_device_id():
+        _set_device_cookie(resp, secrets.token_hex(16))
+    return resp
+
+
 @app.route('/welcome')
 def welcome():
     if auth.enabled() and _session_valid():
         return redirect(url_for('index'))
-    return render_template('landing.html', tiers=auth.TIERS_LIST,
-                           pay=PAYMENT_INFO, error=None)
+    return _landing()
 
 
 @app.route('/login', methods=['POST'])
@@ -132,13 +163,11 @@ def login():
     if not auth.enabled():
         return redirect(url_for('index'))
     code = (request.form.get('code') or '').strip()
-    # Stable per-browser id: a code locks to the FIRST device that redeems it.
-    # Accept an existing cookie only if it looks like one we issued (32 hex
-    # chars); otherwise mint a fresh id so a malformed/injected value never
-    # reaches the DB.
-    device_id = request.cookies.get('tmfg_device') or ''
-    if not re.fullmatch(r'[0-9a-f]{32}', device_id):
-        device_id = secrets.token_hex(16)
+    # Reuse the id the landing page already handed this browser; only mint a new
+    # one as a last resort (e.g. a POST that skipped /welcome). Because the id is
+    # already an accepted cookie, redeeming twice (double-tap) binds to the same
+    # device and stays idempotent instead of eating the code.
+    device_id = _read_device_id() or secrets.token_hex(16)
     res = auth.redeem(code, device_id)
     if res.get('ok'):
         exp = res['expires_at']
@@ -146,15 +175,7 @@ def login():
         session['access_code'] = code.upper()
         session['access_tier'] = res['tier']
         session['access_exp'] = exp.timestamp() if hasattr(exp, 'timestamp') else float(exp)
-        resp = redirect(url_for('index'))
-        # Mark the cookie Secure when the browser reached us over HTTPS (the
-        # Replit proxy sets X-Forwarded-Proto); left off for plain-http local
-        # dev so testing still works.
-        xfp = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip()
-        secure = request.is_secure or xfp == 'https'
-        resp.set_cookie('tmfg_device', device_id, max_age=400 * 24 * 3600,
-                        httponly=True, samesite='Lax', secure=secure)
-        return resp
+        return _set_device_cookie(redirect(url_for('index')), device_id)
     reasons = {
         'invalid': 'That access code is not valid.',
         'expired': 'That access code has expired.',
@@ -163,8 +184,11 @@ def login():
                   'Each code works on one device only.',
         'empty': 'Please enter your access code.',
     }
-    return render_template('landing.html', tiers=auth.TIERS_LIST, pay=PAYMENT_INFO,
-                           error=reasons.get(res.get('reason'), 'Could not log in.')), 401
+    # Keep the same device id on the retry page so the next attempt reuses it.
+    resp = make_response(render_template('landing.html', tiers=auth.TIERS_LIST,
+                         pay=PAYMENT_INFO,
+                         error=reasons.get(res.get('reason'), 'Could not log in.')), 401)
+    return _set_device_cookie(resp, device_id)
 
 
 @app.route('/logout', methods=['GET', 'POST'])
@@ -206,6 +230,12 @@ def _get_job(job_id):
 
 @app.route('/')
 def index():
+    # Unauthenticated visitors — and the deployment's "/" healthcheck — get the
+    # landing page with a 200 here instead of a redirect, since some deploy
+    # healthcheckers only treat a 2xx on "/" as healthy. Authenticated users get
+    # the app itself.
+    if auth.enabled() and not _session_valid():
+        return _landing()
     return render_template('index.html')
 
 
@@ -659,8 +689,23 @@ if __name__ == '__main__':
         except Exception as e:  # noqa: BLE001
             print(f'[Auth] init_db failed: {e}')
         if telegram_bot.enabled():
-            eventlet.spawn(telegram_bot.run)
-            print('[Bot] Telegram code bot started.')
+            # The bot writes codes into whatever DB this process is connected to.
+            # In development that's the DEV database, but the PUBLISHED app reads
+            # the PRODUCTION database — so a dev bot creates codes the live app can
+            # never see ("invalid code"). Only run the bot where it writes to the
+            # same DB the live app reads: the Replit deployment (REPLIT_DEPLOYMENT
+            # is set there), or any host where we opt in with RUN_TELEGRAM_BOT=1.
+            run_bot = bool(os.environ.get('REPLIT_DEPLOYMENT')) or \
+                os.environ.get('RUN_TELEGRAM_BOT') == '1'
+            if run_bot:
+                eventlet.spawn(telegram_bot.run)
+                print('[Bot] Telegram code bot started — codes go to THIS '
+                      'environment\'s database.')
+            else:
+                print('[Bot] Telegram bot idle in development. It runs only in the '
+                      'published app, so generated codes land in the PRODUCTION '
+                      'database the live site reads. Set RUN_TELEGRAM_BOT=1 to force '
+                      'it here for local testing.')
         else:
             print('[Bot] Telegram bot idle — set TELEGRAM_BOT_TOKEN + '
                   'BOT_ADMIN_PASSPHRASE to enable code generation.')

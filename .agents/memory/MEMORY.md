@@ -2,7 +2,9 @@
 - [DeepFaceLive env recovery & branch hazard](deepfacelive-recovery.md) — lost .replit → reinstall python + reconfigure workflow; branches track different file sets, switching can clobber untracked source.
 - [DeepFaceLive Colab GPU + branch parity](deepfacelive-colab-gpu.md) — smooth path = slim colab-gpu branch on free Colab GPU; GPU auto-detect + CPU fallback; deploy-clean holds the complete backend colab-gpu must carry.
 - [DeepFaceLive access gate](deepfacelive-access-gate.md) — paywall active only when DATABASE_URL set; keep /call + WebRTC signaling public; gate the `frame` socket event (not connect) for paid compute.
+- [DeepFaceLive code-bind lockout](deepfacelive-access-gate.md) — issue the device cookie on the landing GET before redeem; binding during the login POST lets a dropped response/double-tap eat a paid code as "in_use".
 - [DeepFaceLive OpenCV system libs](deepfacelive-opencv-system-libs.md) — cv2 import dies after an env reboot (libxcb/libGL/glib); restore via installSystemDependencies + commit replit.nix.
 - [DeepFaceLive DFM swap quality](deepfacelive-swap-quality.md) — "melted clown" = wide face_coverage starves the fixed 224px model; tighten coverage (~1.5) + LANCZOS + unsharp.
 - [DeepFaceLive silent CPU fallback](deepfacelive-colab-gpu.md) — "on GPU but laggy" often = ORT silently ran on CPU; trust sess.get_providers() not host guess; log_severity=4 hides the reason.
 - [DeepFaceLive publishing](deepfacelive-deployment.md) — always-on host (Replit VM/Railway) not autoscale; slim build via .replitignore; bind $PORT for Railway; CPU host = backend only, GPU stays on Colab.
+- [DeepFaceLive prod DB gating](deepfacelive-deployment.md) — dev & prod are separate DBs; run the code-bot only in the deployment, else codes land in dev DB and the live app says "invalid code".
