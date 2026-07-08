@@ -34,3 +34,16 @@ reinstall + workflow reconfigure fully restores it without git surgery or edits.
 - Note: the UI (index.html) on master still shows a "Start Video Call" button,
   but master's backend has no `/call` route, so that feature is dead on master;
   the basic swap (webcam frames, photo upload, DFM models) works.
+
+# "Nothing to preview" = reset silently put you back on `master` + dropped the workflow
+Symptom (often reported from the phone): the preview pane shows "No previewable Apps
+yet". Cause: a checkpoint/restore left the working tree on `master` — the OLD stripped
+app (tiny `web_server.py`, no `static/`, no `/api/target_face`) — and removed the run
+workflow. The app is NOT broken; it's the wrong branch with no process running.
+**Recover:** `git fetch origin colab-gpu` → `git checkout -f colab-gpu` →
+`git reset --hard origin/colab-gpu` (the complete app is committed there and on GitHub),
+then ensure a workflow runs `python web_server.py` on port 5000 (webview) — it often
+re-adds itself on the branch switch. Verify `/` and `/static/favicon.ico` return 200.
+**Why:** `colab-gpu` is the canonical app but an orphan branch; the platform's default
+branch (`master`, the regression) can reassert itself on restore. ALWAYS confirm the
+current branch before treating a "broken app" report as a code bug.
