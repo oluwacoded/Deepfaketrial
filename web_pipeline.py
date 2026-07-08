@@ -138,7 +138,6 @@ class FaceSwapPipeline:
                          args=(model_name,), daemon=True).start()
 
     def _load_model_thread(self, model_name: str):
-        global _device
         from modelhub.DFLive.DFMModel import get_available_models_info
 
         try:
@@ -157,16 +156,16 @@ class FaceSwapPipeline:
             device = _device
             dfm_model, error = self._run_dfm_initializer(info, device)
 
-            # If the model failed to initialise on the GPU, retry once on CPU so
-            # face-swap still works (e.g. onnxruntime-gpu / CUDA version mismatch
-            # on Colab). Mirrors the detector's fallback above.
+            # If the model failed to initialise on the GPU, retry this one load on
+            # CPU so face-swap still works (e.g. onnxruntime-gpu / CUDA mismatch on
+            # Colab). We do NOT permanently demote the global device here: a
+            # transient download/model error must not force later loads onto CPU,
+            # and a truly broken GPU is already caught by the detector at startup.
             if error is not None and not device.is_cpu():
                 print(f'[Pipeline] Model load failed on GPU ({error}); retrying on CPU...')
-                with _device_lock:
-                    _device = _cpu_device
-                device = _cpu_device
                 with self._lock:
                     self._model_load_progress = 0.0
+                device = _cpu_device
                 dfm_model, error = self._run_dfm_initializer(info, device)
 
             if dfm_model is not None:
