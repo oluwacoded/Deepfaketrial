@@ -1,0 +1,3 @@
+- [DeepFaceLive CPU perf](deepfacelive-cpu-perf.md) — live FPS capped by server CPU inference; DFM ~12x slower than paste; smooth DFM needs a GPU.
+- [DeepFaceLive env recovery & branch hazard](deepfacelive-recovery.md) — lost .replit → reinstall python + reconfigure workflow; branches track different file sets, switching can clobber untracked source.
+- [DeepFaceLive Colab GPU + branch parity](deepfacelive-colab-gpu.md) — smooth path = slim colab-gpu branch on free Colab GPU; GPU auto-detect + CPU fallback; deploy-clean holds the complete backend colab-gpu must carry.
