@@ -17,6 +17,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -212,10 +214,20 @@ os.makedirs(_VIDEO_DIR, exist_ok=True)
 _video_jobs = {}
 _video_jobs_lock = threading.Lock()
 
+# Processed videos are throwaway artifacts: keep them only long enough for the
+# user to download, then reclaim the disk. Without this, every {job_id}_out.mp4
+# lived in the temp dir forever and slowly filled the host.
+_VIDEO_TTL_SECONDS = 60 * 60                     # discard renders older than 1h
+_VIDEO_DIR_MAX_BYTES = 2 * 1024 * 1024 * 1024    # hard cap: 2 GB, oldest-first
+
 
 def _set_job(job_id, **fields):
     with _video_jobs_lock:
         job = _video_jobs.setdefault(job_id, {})
+        # Stamp the completion time once, so record retention is measured from
+        # when the job FINISHED rather than when it was uploaded.
+        if fields.get('status') in ('done', 'error') and 'finished_at' not in job:
+            fields.setdefault('finished_at', time.time())
         job.update(fields)
 
 
@@ -489,7 +501,8 @@ def on_end_call(data):
 # -----------------------------------------------------------------------
 
 def _process_video_job(job_id, input_path, output_path):
-    """Background worker: decode video, swap each frame, re-encode to MP4."""
+    """Background worker: decode video, swap each frame to a SILENT render, then
+    mux the original audio back in so the download keeps its sound."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         _set_job(job_id, status='error',
@@ -502,6 +515,9 @@ def _process_video_job(job_id, input_path, output_path):
         fps = 24.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
+    # OpenCV's VideoWriter can only write video, so frames go to a silent temp
+    # file first; the original audio is muxed in afterwards with ffmpeg.
+    silent_path = os.path.join(_VIDEO_DIR, f'{job_id}_silent.mp4')
     writer = None
     out_w = out_h = 0
     frames_done = 0
@@ -526,7 +542,7 @@ def _process_video_job(job_id, input_path, output_path):
             if writer is None:
                 out_h, out_w = out_frame.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(output_path, fourcc, fps,
+                writer = cv2.VideoWriter(silent_path, fourcc, fps,
                                          (out_w, out_h))
             elif (out_frame.shape[1], out_frame.shape[0]) != (out_w, out_h):
                 out_frame = cv2.resize(out_frame, (out_w, out_h))
@@ -554,17 +570,31 @@ def _process_video_job(job_id, input_path, output_path):
         if writer is not None:
             writer.release()
         _safe_remove(input_path)
+        _safe_remove(silent_path)
         return
     finally:
         cap.release()
         if writer is not None:
             writer.release()
-        _safe_remove(input_path)
 
     if frames_done == 0:
         _set_job(job_id, status='error',
                  error='No frames could be read from that video.')
-        _safe_remove(output_path)
+        _safe_remove(input_path)
+        _safe_remove(silent_path)
+        return
+
+    # Re-attach the original soundtrack. The input file is still needed here as
+    # the audio source, so it's only cleaned up after muxing.
+    try:
+        _mux_original_audio(silent_path, input_path, output_path)
+    finally:
+        _safe_remove(input_path)
+        _safe_remove(silent_path)
+
+    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+        _set_job(job_id, status='error',
+                 error='Could not finalize the swapped video.')
         return
 
     _set_job(job_id, status='done', progress=100.0,
@@ -572,11 +602,120 @@ def _process_video_job(job_id, input_path, output_path):
 
 
 def _safe_remove(path):
+    """Delete a file if present. Returns True when the path is gone afterwards
+    (deleted or never existed), False only if the unlink failed."""
     try:
         if path and os.path.exists(path):
             os.remove(path)
+        return True
     except OSError:
-        pass
+        return False
+
+
+def _mux_original_audio(silent_path, source_path, output_path):
+    """Combine the swapped (silent) video with the audio from the original
+    upload into output_path. ffmpeg copies the video stream untouched and only
+    encodes audio, so it's fast. Falls back to the silent render (copied to
+    output_path) when the source has no audio or ffmpeg is unavailable, so the
+    job still yields a downloadable file either way.
+
+    subprocess is eventlet-green here (monkey_patched), so the wait yields to the
+    event loop and ffmpeg's work runs in a separate process — no server hang."""
+    cmd = [
+        'ffmpeg', '-y', '-loglevel', 'error',
+        '-i', silent_path,          # 0: swapped video (no audio)
+        '-i', source_path,          # 1: original upload (for its audio)
+        '-map', '0:v:0',            # video from the swap
+        '-map', '1:a:0?',           # audio from the original ('?' = optional)
+        '-c:v', 'copy',             # keep the swapped video as-is (fast)
+        '-c:a', 'aac', '-b:a', '192k',
+        '-shortest', '-movflags', '+faststart',
+        output_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=600)
+        if (proc.returncode == 0 and os.path.exists(output_path)
+                and os.path.getsize(output_path) > 0):
+            return
+        detail = (proc.stderr or b'').decode('utf-8', 'replace').strip()[:300]
+        print(f'[Video] audio mux failed (rc={proc.returncode}); '
+              f'serving silent video. ffmpeg: {detail}')
+    except Exception as e:  # noqa: BLE001 — ffmpeg missing, timeout, etc.
+        print(f'[Video] audio mux error ({e}); serving silent video.')
+
+    # Fallback: hand back the silent render so the download still works.
+    try:
+        _safe_remove(output_path)
+        shutil.copyfile(silent_path, output_path)
+    except OSError as e:
+        print(f'[Video] fallback copy failed: {e}')
+
+
+def _cleanup_video_dir():
+    """Reclaim disk from finished/orphaned video files. Deletes anything past
+    the TTL, then — if the folder is still over its size cap — removes the oldest
+    files until it fits, and finally prunes stale job records. Runs on every new
+    upload and on a periodic sweep. Best-effort; never raises."""
+    now = time.time()
+    # Never touch files belonging to a job that is still uploading or running.
+    with _video_jobs_lock:
+        active = tuple(jid for jid, job in _video_jobs.items()
+                       if job.get('status') in ('uploading', 'processing'))
+    try:
+        entries = []
+        for name in os.listdir(_VIDEO_DIR):
+            if active and name.startswith(active):
+                continue
+            path = os.path.join(_VIDEO_DIR, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if os.path.isfile(path):
+                entries.append((path, st.st_mtime, st.st_size))
+    except OSError:
+        return
+
+    survivors = []
+    for path, mtime, size in entries:
+        if now - mtime > _VIDEO_TTL_SECONDS:
+            _safe_remove(path)
+        else:
+            survivors.append((path, mtime, size))
+
+    # Size cap: drop oldest renders until under the limit. Only count space as
+    # freed when the delete actually succeeds, to avoid accounting drift.
+    total = sum(size for _, _, size in survivors)
+    if total > _VIDEO_DIR_MAX_BYTES:
+        for path, _mtime, size in sorted(survivors, key=lambda e: e[1]):
+            if total <= _VIDEO_DIR_MAX_BYTES:
+                break
+            if _safe_remove(path):
+                total -= size
+
+    # Prune job records once their result is gone. Retention is anchored to when
+    # the job FINISHED (not when it was uploaded), so a long (>TTL) render isn't
+    # dropped the instant it completes. Never prune an uploading/running job.
+    with _video_jobs_lock:
+        for job_id in list(_video_jobs.keys()):
+            job = _video_jobs[job_id]
+            if job.get('status') in ('uploading', 'processing'):
+                continue
+            out = job.get('output_path')
+            if out and os.path.exists(out):
+                continue  # result still downloadable — keep the record
+            if job.get('status') == 'done' or \
+                    (now - job.get('finished_at', now) > _VIDEO_TTL_SECONDS):
+                _video_jobs.pop(job_id, None)
+
+
+def _video_janitor():
+    """Periodic sweep so renders are reclaimed even without new uploads (e.g. a
+    user downloads once and leaves)."""
+    while True:
+        socketio.sleep(600)  # every 10 minutes
+        _cleanup_video_dir()
 
 
 @app.route('/api/process_video', methods=['POST'])
@@ -592,17 +731,25 @@ def api_process_video():
         return jsonify({'error': f'Unsupported video type: {ext or "unknown"}. '
                                  'Use MP4, WebM, AVI, or MOV.'}), 415
 
+    # Reclaim disk from previous jobs before writing a new (possibly large) file.
+    _cleanup_video_dir()
+
     job_id = uuid.uuid4().hex
     input_path = os.path.join(_VIDEO_DIR, f'{job_id}_in{ext}')
     output_path = os.path.join(_VIDEO_DIR, f'{job_id}_out.mp4')
+    # Register BEFORE writing the file so a concurrent cleanup never mistakes
+    # this job's temp files for orphans (eventlet yields mid-save on big uploads).
+    _set_job(job_id, status='uploading', progress=0.0, frames=0, faces=0,
+             output_path=output_path, created=time.time())
     file.save(input_path)
 
     if os.path.getsize(input_path) == 0:
         _safe_remove(input_path)
+        with _video_jobs_lock:
+            _video_jobs.pop(job_id, None)
         return jsonify({'error': 'Empty file'}), 400
 
-    _set_job(job_id, status='processing', progress=0.0, frames=0, faces=0,
-             output_path=output_path)
+    _set_job(job_id, status='processing')
     socketio.start_background_task(_process_video_job, job_id,
                                    input_path, output_path)
     return jsonify({'job_id': job_id})
@@ -715,5 +862,7 @@ if __name__ == '__main__':
     # Bind to the host-provided port. Railway / Cloud Run inject $PORT (e.g. 8080);
     # Replit and the Colab clone leave it unset, so we fall back to 5000.
     _port = int(os.environ.get('PORT', 5000))
+    # Background sweeper so processed videos don't accumulate on disk.
+    socketio.start_background_task(_video_janitor)
     print(f'Starting DeepFaceLive Web on http://0.0.0.0:{_port}')
     socketio.run(app, host='0.0.0.0', port=_port, debug=False)

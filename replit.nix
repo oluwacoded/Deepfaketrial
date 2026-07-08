@@ -1,5 +1,6 @@
 {pkgs}: {
   deps = [
+    pkgs.ffmpeg
     pkgs.xorg.libICE
     pkgs.xorg.libSM
     pkgs.xorg.libXext
