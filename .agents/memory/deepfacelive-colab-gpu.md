@@ -42,25 +42,33 @@ network hop stays; the GPU removes the compute bottleneck.
 ## One-click user delivery
 Colab-opens-from-GitHub URL (works on phone or desktop):
 `https://colab.research.google.com/github/oluwacoded/Deepfaketrial/blob/colab-gpu/deepfacelive_colab.ipynb`
-Notebook cells: set Runtime→T4 GPU, run 3 cells; the last prints a cloudflared
-`https://...trycloudflare.com` link to open on the phone (HTTPS is required for camera
-`getUserMedia`). Free Colab GPU disconnects after idle → just rerun the cells.
+Notebook is ONE form-mode cell (`#@title ... { display-mode: "form" }` hides the code and
+shows just a play button — right for non-technical buyers): set Runtime→T4 GPU, tap it once.
+It clones + installs + starts the server and prints a cloudflared `https://...trycloudflare.com`
+link + QR to open on the phone (HTTPS is required for camera `getUserMedia`). Free Colab GPU
+disconnects after idle → just tap the cell again. `raise SystemExit` is the clean way to stop
+the cell (no scary traceback) on the no-GPU / install-failed paths.
 
 ## onnxruntime-gpu on Colab can't find cuDNN (the "red cell" failure)
-Unpinned `pip install onnxruntime-gpu` grabs the latest (1.22+), which needs CUDA 12 +
-cuDNN 9 and expects those libs on `LD_LIBRARY_PATH`. On Colab the CUDA provider then fails
-with `libcudnn.so.9: cannot open shared object file` (microsoft/onnxruntime #25609) — so it
-silently drops to CPU, or a bare `import onnxruntime` check turns the notebook cell red.
-**Fix that works:** also install the CUDA-12 nvidia wheels (`nvidia-cudnn-cu12`,
-`nvidia-cublas-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cusparse-cu12`,
-`nvidia-cuda-runtime-cu12`, `nvidia-cuda-nvrtc-cu12`, `nvidia-nvjitlink-cu12`), then prepend
-every `site-packages/nvidia/*/lib` dir to `LD_LIBRARY_PATH` **in the env dict passed to the
-server subprocess** — setting it in the already-running notebook kernel is too late for libs
-it has loaded; a fresh subprocess is what picks it up.
-**Also:** never let the notebook's GPU check hard-crash — run `import onnxruntime` in a
-throwaway subprocess wrapped in try/except and just print status. Combined with the code's
-per-component CPU fallback, the app then runs even if the GPU never engages, instead of
-showing a red error.
+Unpinned `pip install onnxruntime-gpu` grabs the latest (1.22+), which needs CUDA 12 + cuDNN 9.
+The wheel does NOT reliably pick up pip-installed CUDA libs even when they are on
+`LD_LIBRARY_PATH`, so `import onnxruntime` itself crashes with `libcudnn.so.9: cannot open
+shared object file` (microsoft/onnxruntime #23643, #25609). The import raises
+`import_capi_exception`, which kills the whole server — onnxruntime IS the inference engine, so
+there is no "drop to CPU": if the import dies, nothing runs.
+**Best fix (current):** `pip install "onnxruntime-gpu[cuda,cudnn]"` — the extra pulls the EXACT
+matching CUDA + cuDNN nvidia wheels, so onnxruntime is self-contained and independent of
+whatever CUDA/cuDNN Colab ships that week. Then call `onnxruntime.preload_dlls()` (GPU build
+>=1.21 only) BEFORE any InferenceSession — it ctypes-loads those libs from site-packages,
+bypassing the LD_LIBRARY_PATH/RPATH problem. The app does this at the top of `web_server.py`,
+guarded by `hasattr(_ort, "preload_dlls")` so it is a harmless no-op on the CPU-only Replit
+host (verified: prints "preloaded" then runs CPU inference fine).
+**Belt & braces:** the notebook still prepends every `site-packages/nvidia/*/lib` dir to
+`LD_LIBRARY_PATH` in the env dict passed to the server subprocess (a fresh process is what
+picks up lib-path changes; the already-running kernel is too late).
+**Why not hand-pin the nvidia-*-cu12 wheels (the old fix):** it works but drifts out of sync
+with the onnxruntime build's exact cuDNN version; the `[cuda,cudnn]` extra lets pip resolve the
+right versions instead.
 
 ## Branch feature-parity: `deploy-clean` holds the complete backend
 Divergent branches carry DIFFERENT feature sets. `deploy-clean` is the FEATURE-COMPLETE
