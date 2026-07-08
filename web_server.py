@@ -667,5 +667,8 @@ if __name__ == '__main__':
     else:
         print('[Auth] No DATABASE_URL — running OPEN, no access gate '
               '(expected on the Colab GPU clone).')
-    print('Starting DeepFaceLive Web on http://0.0.0.0:5000')
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    # Bind to the host-provided port. Railway / Cloud Run inject $PORT (e.g. 8080);
+    # Replit and the Colab clone leave it unset, so we fall back to 5000.
+    _port = int(os.environ.get('PORT', 5000))
+    print(f'Starting DeepFaceLive Web on http://0.0.0.0:{_port}')
+    socketio.run(app, host='0.0.0.0', port=_port, debug=False)

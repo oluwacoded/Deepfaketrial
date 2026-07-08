@@ -33,3 +33,19 @@ difference, so state the trade-off and let them choose at Publish time.
 `TELEGRAM_BOT_TOKEN` can only be long-polled by ONE process. If the dev workflow AND the
 published VM both run the bot, Telegram returns 409 Conflict. After publishing, only one
 should poll (stop the dev bot, or let prod win).
+
+## Any CPU host (Railway, Replit) is a backend, never the GPU
+Railway rents CPU only — no GPU (its "Metal"/AI-hosting marketing is faster CPU + hosting
+the app layer, not model inference). Running the swap on Railway lags exactly like Replit;
+smooth DFM still needs the Colab T4 (or a paid GPU host). A CPU host's only useful role is
+the always-on backend (serve UI + Telegram bot + access gate + WebRTC signaling) — the SAME
+job as the Replit Reserved VM. So don't run BOTH a Railway service and a Replit VM; that's
+paying twice for one role.
+
+## Bind $PORT or Railway/Cloud Run can't reach the app
+`web_server.py` must bind `int(os.environ.get('PORT', 5000))`, not a hardcoded 5000.
+Railway (and Cloud Run) route their public domain to a proxy target port (user saw 8080)
+and inject $PORT; a hardcoded port means the edge proxy can't connect and the URL just
+times out (Railway "Application Failed to Respond" / 502). The 5000 fallback keeps Replit
+and the Colab clone working (they leave $PORT unset). On Railway, set a service variable
+`PORT=8080` to match the generated domain's target port.
