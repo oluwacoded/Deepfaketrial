@@ -67,6 +67,18 @@ _device = _pick_device()
 _device_lock = threading.Lock()
 
 
+def _sess_providers(sess):
+    """Return (on_gpu, providers) for an onnxruntime InferenceSession, safely.
+    ONNX Runtime silently appends CPU and drops a GPU EP that failed to load, so
+    get_providers() is the source of truth for what is ACTUALLY running."""
+    try:
+        provs = list(sess.get_providers())
+    except Exception:
+        return False, []
+    on_gpu = any(p in ('CUDAExecutionProvider', 'DmlExecutionProvider') for p in provs)
+    return on_gpu, provs
+
+
 class FaceSwapPipeline:
     def __init__(self):
         self._lock = threading.RLock()
@@ -77,6 +89,10 @@ class FaceSwapPipeline:
         self._model_load_progress: float = 0.0
         self._model_load_error: Optional[str] = None
         self._enabled = True
+        # Actual execution provider in use (None until probed). ONNX Runtime can
+        # silently run on CPU even on a GPU host, so we record the real answer.
+        self._detector_on_gpu: Optional[bool] = None
+        self._model_on_gpu: Optional[bool] = None
 
         # Custom target face (paste mode) — BGR crop of the uploaded face+head
         self._target_face_bgr: Optional[np.ndarray] = None
@@ -85,13 +101,15 @@ class FaceSwapPipeline:
         self._preferred_rot = 0
 
         # Merge params
-        self.face_coverage = 2.0      # matches model training; wider washes out
-        self.face_output_size = 224   # match model input res (avoid lossy double-resize)
+        self.face_coverage = 1.5      # tighter crop -> more real face fills the 224 model
+                                      #   -> much sharper, and kills the ghosted/melted look
+        self.face_output_size = 320   # cut & merge above model res for a cleaner upscaled warp
         self.morph_factor = 0.75
         self.face_opacity = 1.0
         self.erode_amount = 4
         self.blur_amount = 35
         self.color_transfer = 'rct'   # 'rct' or 'none'
+        self.sharpen_amount = 0.55    # unsharp on the swap; counters 224-model softness
 
         self._init_detector()
 
@@ -102,6 +120,13 @@ class FaceSwapPipeline:
             self._detector = YoloV5Face(_device)
             where = 'CPU' if _device.is_cpu() else f'GPU ({_device})'
             print(f'[Pipeline] YoloV5Face detector ready on {where}.')
+            gpu, provs = _sess_providers(self._detector._sess)
+            self._detector_on_gpu = gpu
+            print(f'[Pipeline] Detector execution providers: {provs}')
+            if not _device.is_cpu() and not gpu:
+                print('[Pipeline] !! GPU detected but ONNX Runtime fell back to CPU — '
+                      'inference will be SLOW. See the ONNX Runtime warning above '
+                      '(usually a CUDA/cuDNN mismatch).')
         except Exception as e:
             print(f'[Pipeline] Failed to init detector on {_device}: {e}')
             # A GPU can be detected yet still fail to initialise (e.g.
@@ -113,6 +138,7 @@ class FaceSwapPipeline:
                     _device = _cpu_device
                 try:
                     self._detector = YoloV5Face(_device)
+                    self._detector_on_gpu = False
                     print('[Pipeline] YoloV5Face detector ready on CPU (fallback).')
                 except Exception as e2:
                     print(f'[Pipeline] CPU fallback also failed: {e2}')
@@ -190,11 +216,16 @@ class FaceSwapPipeline:
                 dfm_model, error = self._init_dfm(info, _cpu_device)
 
             if dfm_model is not None:
+                gpu, provs = _sess_providers(dfm_model._sess)
                 with self._lock:
                     self._dfm_model = dfm_model
                     self._current_model_name = model_name
                     self._model_load_progress = 100.0
-                print(f'[Pipeline] Model "{model_name}" loaded.')
+                    self._model_on_gpu = gpu
+                print(f'[Pipeline] Model "{model_name}" loaded. Execution providers: {provs}')
+                if not gpu and not device.is_cpu():
+                    print('[Pipeline] !! Model requested GPU but is running on CPU — '
+                          'DFM will be laggy. Likely a CUDA/cuDNN mismatch.')
             else:
                 with self._lock:
                     self._model_load_error = error
@@ -212,6 +243,7 @@ class FaceSwapPipeline:
             self._dfm_model = None
             self._current_model_name = None
             self._model_load_error = None
+            self._model_on_gpu = None
 
     def get_model_status(self):
         with self._lock:
@@ -224,8 +256,19 @@ class FaceSwapPipeline:
                 'error': self._model_load_error,
                 'mode': mode,
                 'target_face_set': has_target,
-                'device': 'cpu' if _device.is_cpu() else 'gpu',
+                'device': self._effective_device(),
             }
+
+    def _effective_device(self) -> str:
+        """Report the device inference is ACTUALLY on (ONNX Runtime can silently
+        fall back to CPU on a GPU host, e.g. a CUDA/cuDNN mismatch)."""
+        if self._dfm_model is not None and self._model_on_gpu is not None:
+            on_gpu = self._model_on_gpu
+        elif self._detector_on_gpu is not None:
+            on_gpu = self._detector_on_gpu
+        else:
+            on_gpu = not _device.is_cpu()
+        return 'gpu' if on_gpu else 'cpu'
 
     # ------------------------------------------------------- target (paste)
     def set_target_face(self, jpg_bytes: bytes) -> dict:
@@ -290,6 +333,7 @@ class FaceSwapPipeline:
                 'color_transfer': self.color_transfer,
                 'erode_amount': self.erode_amount,
                 'blur_amount': self.blur_amount,
+                'sharpen_amount': self.sharpen_amount,
             }
 
     def process_frame(self, jpg_bytes: bytes) -> Tuple[bytes, bool, str]:
@@ -425,7 +469,16 @@ class FaceSwapPipeline:
             aligned_to_source_mat, W, H).clip2(1.0 / 255.0, 0.0, 1.0, 1.0).get_image('HWC')
         frame_celeb = celeb_ip.warp_affine(
             aligned_to_source_mat, W, H,
-            interpolation=ImageProcessor.Interpolation.LINEAR).get_image('HWC')
+            interpolation=ImageProcessor.Interpolation.LANCZOS4).get_image('HWC')
+
+        # Sharpen the upscaled swap: the 224px model output goes soft once warped
+        # up to the in-frame face, which reads as a melted/ghosted 'clown' face.
+        sharpen = float(snap.get('sharpen_amount', 0.0))
+        if sharpen > 0.0:
+            blurred = cv2.GaussianBlur(frame_celeb, (0, 0), 1.5)
+            frame_celeb = np.clip(
+                cv2.addWeighted(frame_celeb, 1.0 + sharpen, blurred, -sharpen, 0.0),
+                0.0, 1.0)
 
         opacity = np.float32(snap['face_opacity']); one_f = np.float32(1.0)
         if opacity == 1.0:

@@ -27,7 +27,9 @@ def InferenceSession_with_device(onnx_model_or_path, device_info : ORTDeviceInfo
         ep_flags['device_id'] = device_info.get_index()
 
     sess_options = rt.SessionOptions()
-    sess_options.log_severity_level = 4
+    # On a GPU EP, surface warnings so a silent CPU fallback (e.g. a CUDA/cuDNN
+    # mismatch) shows up in the logs instead of hiding behind a 'GPU' status.
+    sess_options.log_severity_level = 2 if device_ep in ('CUDAExecutionProvider', 'DmlExecutionProvider') else 4
     sess_options.log_verbosity_level = -1
     if device_ep == 'DmlExecutionProvider':
         sess_options.enable_mem_pattern = False
