@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Teddy MFG Call App</title>
+<link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:#0f1117; --surface:#1a1d27; --surface2:#252836;
+  --accent:#6c63ff; --accent2:#a78bfa;
+  --text:#e2e8f0; --muted:#8892a4;
+  --danger:#ef4444; --success:#22c55e; --warn:#f59e0b;
+}
+body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif;
+       min-height:100vh; display:flex; flex-direction:column; }
+
+/* ── Header ── */
+header { background:var(--surface); border-bottom:1px solid rgba(108,99,255,.25);
+         padding:10px 18px; display:flex; align-items:center; gap:10px; flex-shrink:0; }
+.logo { font-size:1.1rem; font-weight:700; background:linear-gradient(135deg,var(--accent),var(--accent2));
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.badge { font-size:.66rem; background:rgba(108,99,255,.2); border:1px solid rgba(108,99,255,.4);
+         color:var(--accent2); padding:2px 8px; border-radius:999px; }
+.conn { margin-left:auto; display:flex; align-items:center; gap:6px; font-size:.78rem; color:var(--muted); }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--muted); transition:background .3s; }
+.dot.on { background:var(--success); }
+
+/* ── Model banner ── */
+#model-banner { background:rgba(245,158,11,.12); border-bottom:1px solid rgba(245,158,11,.3);
+  padding:7px 18px; font-size:.8rem; color:var(--warn); display:flex; align-items:center; gap:8px; flex-shrink:0; }
+#model-banner.hidden { display:none !important; }
+#model-banner strong { color:#fcd34d; }
+
+/* ── Layout ── */
+main { flex:1; display:grid; grid-template-columns:1fr 310px; min-height:0; }
+
+/* ── Left panel ── */
+.left-panel { display:flex; flex-direction:column; min-height:0; background:#000; }
+.tab-bar { display:flex; background:var(--surface); border-bottom:1px solid rgba(255,255,255,.06); flex-shrink:0; }
+.tab { padding:9px 18px; font-size:.84rem; font-weight:600; color:var(--muted);
+       cursor:pointer; border-bottom:2px solid transparent; transition:color .15s,border-color .15s; user-select:none; }
+.tab.active { color:var(--accent2); border-color:var(--accent); }
+
+/* ── Webcam tab (canvas-based, no double-image) ── */
+.cam-view { flex:1; position:relative; display:flex; align-items:center; justify-content:center;
+            min-height:0; overflow:hidden; background:#000; }
+.cam-view.hidden { display:none; }
+
+/* Single canvas replaces video+overlay — eliminates double-image on portrait mobile */
+#display-canvas { max-width:100%; max-height:100%; display:block; }
+video#webcam { display:none; } /* hidden source element */
+
+.vid-label { position:absolute; top:10px; left:10px; font-size:.66rem; background:rgba(0,0,0,.65);
+             color:var(--muted); padding:3px 8px; border-radius:4px; pointer-events:none; }
+.proc-ring { position:absolute; top:10px; right:10px; width:20px; height:20px;
+             border:3px solid rgba(108,99,255,.3); border-top-color:var(--accent);
+             border-radius:50%; animation:spin .8s linear infinite; display:none; }
+.proc-ring.active { display:block; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* Mode badge overlay (bottom-left) */
+#mode-badge { position:absolute; bottom:10px; left:10px; font-size:.68rem; padding:3px 10px;
+              border-radius:999px; pointer-events:none; display:none; }
+#mode-badge.dfm { background:rgba(108,99,255,.25); border:1px solid rgba(108,99,255,.4); color:var(--accent2); }
+#mode-badge.paste { background:rgba(34,197,94,.2); border:1px solid rgba(34,197,94,.4); color:var(--success); }
+#no-face-cam { position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
+               background:rgba(245,158,11,.15); border:1px solid rgba(245,158,11,.35); color:var(--warn);
+               font-size:.76rem; padding:4px 14px; border-radius:20px; pointer-events:none;
+               opacity:0; transition:opacity .4s; white-space:nowrap; }
+#no-face-cam.visible { opacity:1; }
+
+/* ── Image upload tab ── */
+.img-view { flex:1; display:flex; align-items:stretch; min-height:0; overflow:hidden; }
+.img-view.hidden { display:none; }
+
+.upload-pane { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+               gap:14px; background:#000; }
+.upload-pane.hidden { display:none; }
+.drop-zone { border:2px dashed rgba(108,99,255,.4); border-radius:14px; padding:36px 28px;
+             text-align:center; cursor:pointer; transition:border-color .2s,background .2s; max-width:380px; width:90%; }
+.drop-zone:hover,.drop-zone.over { border-color:var(--accent); background:rgba(108,99,255,.07); }
+.drop-zone .icon { font-size:2.4rem; margin-bottom:10px; }
+.drop-zone p { color:var(--muted); font-size:.86rem; line-height:1.5; }
+.drop-zone strong { color:var(--text); }
+#file-input { display:none; }
+
+.img-preview-pane { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+.img-preview-pane.hidden { display:none; }
+.img-results { flex:1; display:flex; min-height:0; overflow:hidden; }
+.img-pane { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+            background:#000; position:relative; overflow:hidden; }
+.img-pane img { max-width:100%; max-height:100%; width:100%; height:100%; object-fit:contain; }
+.img-pane-label { position:absolute; top:10px; left:50%; transform:translateX(-50%);
+                  font-size:.68rem; background:rgba(0,0,0,.7); color:var(--muted);
+                  padding:3px 10px; border-radius:4px; white-space:nowrap; }
+.img-pane-label.swapped { color:var(--accent2); }
+.img-divider { width:1px; background:rgba(255,255,255,.08); flex-shrink:0; }
+.img-processing { position:absolute; inset:0; background:rgba(0,0,0,.65); display:none;
+                  align-items:center; justify-content:center; flex-direction:column; gap:12px; }
+.img-processing.active { display:flex; }
+.big-ring { width:48px; height:48px; border:4px solid rgba(108,99,255,.3); border-top-color:var(--accent);
+            border-radius:50%; animation:spin .9s linear infinite; }
+.no-face-msg { display:none; position:absolute; inset:0; align-items:center; justify-content:center;
+               flex-direction:column; gap:8px; background:rgba(0,0,0,.55); color:var(--warn);
+               font-size:.86rem; text-align:center; padding:20px; }
+.no-face-msg.active { display:flex; }
+.img-action-bar { background:var(--surface); border-top:1px solid rgba(255,255,255,.06);
+                  padding:10px 14px; display:flex; gap:8px; flex-shrink:0; }
+.img-action-bar .btn { flex:1; margin-bottom:0; }
+
+/* ── Sidebar ── */
+.sidebar { background:var(--surface); border-left:1px solid rgba(255,255,255,.06);
+           display:flex; flex-direction:column; overflow-y:auto; }
+.section { padding:13px 15px; border-bottom:1px solid rgba(255,255,255,.05); }
+.section-title { font-size:.64rem; font-weight:700; text-transform:uppercase;
+                 letter-spacing:1.2px; color:var(--muted); margin-bottom:9px; }
+
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px;
+       padding:8px 14px; border-radius:8px; border:none; font-size:.84rem; font-weight:600;
+       cursor:pointer; transition:opacity .15s,transform .1s; width:100%; margin-bottom:6px; }
+.btn:last-child { margin-bottom:0; }
+.btn:active { transform:scale(.97); }
+.btn:disabled { opacity:.4; cursor:not-allowed; }
+.btn-primary { background:var(--accent); color:#fff; }
+.btn-primary:not(:disabled):hover { background:#5a52e0; }
+.btn-secondary { background:var(--surface2); color:var(--text); border:1px solid rgba(255,255,255,.1); }
+.btn-secondary:not(:disabled):hover { border-color:var(--accent); }
+.btn-danger { background:rgba(239,68,68,.12); color:var(--danger); border:1px solid rgba(239,68,68,.2); }
+.btn-success { background:rgba(34,197,94,.15); color:var(--success); border:1px solid rgba(34,197,94,.3); }
+
+.model-select { width:100%; background:var(--surface2); border:1px solid rgba(255,255,255,.1);
+                color:var(--text); padding:8px 10px; border-radius:8px; font-size:.86rem;
+                margin-bottom:9px; cursor:pointer; outline:none; }
+.model-select:focus { border-color:var(--accent); }
+.model-select option { background:#1a1d27; }
+
+.progress-wrap { margin:5px 0 9px; }
+.progress-label { font-size:.74rem; color:var(--muted); margin-bottom:4px; display:flex; justify-content:space-between; }
+.progress-bar { height:5px; background:var(--surface2); border-radius:99px; overflow:hidden; }
+.progress-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--accent2)); border-radius:99px; transition:width .3s; }
+
+.slider-row { margin-bottom:11px; }
+.slider-row label { font-size:.78rem; color:var(--muted); display:flex; justify-content:space-between; margin-bottom:4px; }
+.slider-row label span { color:var(--text); font-weight:600; }
+input[type=range] { width:100%; accent-color:var(--accent); cursor:pointer; }
+
+.toggle-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:9px; }
+.toggle-row span { font-size:.84rem; }
+.toggle { position:relative; width:38px; height:21px; display:inline-block; }
+.toggle input { opacity:0; width:0; height:0; }
+.toggle-slider { position:absolute; inset:0; background:var(--surface2); border-radius:99px;
+                 cursor:pointer; transition:background .2s; border:1px solid rgba(255,255,255,.1); }
+.toggle-slider::before { content:''; position:absolute; left:3px; top:3px; width:13px; height:13px;
+                          background:var(--muted); border-radius:50%; transition:transform .2s,background .2s; }
+input:checked + .toggle-slider { background:var(--accent); }
+input:checked + .toggle-slider::before { transform:translateX(17px); background:#fff; }
+
+.select-row { margin-bottom:9px; }
+.select-row label { font-size:.78rem; color:var(--muted); display:block; margin-bottom:3px; }
+.select-row select { width:100%; background:var(--surface2); border:1px solid rgba(255,255,255,.1);
+                     color:var(--text); padding:6px 9px; border-radius:7px; font-size:.84rem; cursor:pointer; outline:none; }
+
+.alert { padding:7px 11px; border-radius:8px; font-size:.78rem; margin-bottom:7px; line-height:1.4; }
+.alert:last-child { margin-bottom:0; }
+.alert-info    { background:rgba(108,99,255,.1); border:1px solid rgba(108,99,255,.25); color:var(--accent2); }
+.alert-warn    { background:rgba(245,158,11,.1);  border:1px solid rgba(245,158,11,.25); color:var(--warn); }
+.alert-error   { background:rgba(239,68,68,.1);   border:1px solid rgba(239,68,68,.25);  color:var(--danger); }
+.alert-success { background:rgba(34,197,94,.1);   border:1px solid rgba(34,197,94,.25);  color:var(--success); }
+.alert-hidden  { display:none; }
+
+/* Target face thumbnail */
+.face-thumb-wrap { display:none; margin-bottom:8px; }
+.face-thumb-wrap.visible { display:flex; align-items:center; gap:10px; }
+.face-thumb { width:52px; height:52px; border-radius:50%; object-fit:cover;
+              border:2px solid var(--success); }
+.face-thumb-info { font-size:.78rem; color:var(--muted); line-height:1.5; }
+.face-thumb-info strong { color:var(--success); display:block; }
+
+/* Call section */
+.call-link-box { background:var(--surface2); border:1px solid rgba(108,99,255,.25); border-radius:8px;
+                 padding:8px 10px; margin-bottom:8px; word-break:break-all; font-size:.72rem;
+                 color:var(--accent2); display:none; }
+.call-link-box.visible { display:block; }
+
+.stats-bar { padding:7px 18px; background:var(--surface); border-top:1px solid rgba(255,255,255,.05);
+             display:flex; gap:18px; font-size:.72rem; color:var(--muted); flex-shrink:0; }
+.stats-bar span b { color:var(--text); }
+
+.hidden { display:none !important; }
+
+@media (max-width:700px) {
+  main { grid-template-columns:1fr; }
+  .sidebar { border-left:none; border-top:1px solid rgba(255,255,255,.06); max-height:50vh; }
+  .img-results { flex-direction:column; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Teddy MFG Call App</div>
+  <div class="badge">Live</div>
+  <div class="conn"><div class="dot" id="conn-dot"></div><span id="conn-label">Connecting…</span></div>
+</header>
+
+<div id="model-banner">
+  ⚠️ <strong>Step 1:</strong> Either upload a face photo (sidebar → "Your Face") or load a DFM model — then swap works.
+</div>
+
+<main>
+  <!-- ── Left panel ── -->
+  <div class="left-panel">
+    <div class="tab-bar">
+      <div class="tab active" data-tab="cam">📷 Live Webcam</div>
+      <div class="tab" data-tab="img">🖼 Upload Photo</div>
+    </div>
+
+    <!-- Webcam tab — single canvas, no overlay -->
+    <div class="cam-view" id="tab-cam">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="display-canvas"></canvas>
+      <div class="vid-label" id="vid-label">Start camera →</div>
+      <div class="proc-ring" id="proc-ring"></div>
+      <div id="mode-badge"></div>
+      <div id="no-face-cam">😶 No face detected — move closer or improve lighting</div>
+    </div>
+
+    <!-- Image upload tab -->
+    <div class="img-view hidden" id="tab-img">
+      <div class="upload-pane" id="upload-pane">
+        <div class="drop-zone" id="drop-zone">
+          <div class="icon">📤</div>
+          <p><strong>Click or drag &amp; drop</strong> a photo here</p>
+          <p style="margin-top:5px">JPG, PNG, WebP — any size</p>
+        </div>
+        <input type="file" id="file-input" accept="image/*">
+        <div id="upload-alert" class="alert alert-hidden"></div>
+      </div>
+
+      <div class="img-preview-pane hidden" id="img-preview-pane">
+        <div class="img-results">
+          <div class="img-pane">
+            <img id="img-original" alt="Original">
+            <div class="img-pane-label">ORIGINAL</div>
+          </div>
+          <div class="img-divider"></div>
+          <div class="img-pane">
+            <img id="img-swapped" alt="Swapped" style="opacity:.1">
+            <div class="img-pane-label swapped">SWAPPED</div>
+            <div class="img-processing" id="img-processing">
+              <div class="big-ring"></div>
+              <span style="font-size:.84rem;color:var(--muted)">Processing… (CPU ~5–15s)</span>
+            </div>
+            <div class="no-face-msg" id="no-face-msg">
+              <span style="font-size:1.4rem">😶</span>
+              <span>No face detected.<br>Try better lighting or a clearer front-facing photo.</span>
+            </div>
+          </div>
+        </div>
+        <div class="img-action-bar">
+          <button class="btn btn-primary" id="btn-swap-photo">🔄 Swap Face</button>
+          <button class="btn btn-secondary" id="btn-new-photo">📂 New Photo</button>
+          <a class="btn btn-success hidden" id="btn-download" download="swapped.jpg">⬇ Save</a>
+        </div>
+        <div id="img-result-alert" class="alert alert-hidden" style="margin:0 14px 10px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+
+    <!-- Camera controls -->
+    <div class="section" id="cam-section">
+      <div class="section-title">Camera</div>
+      <button class="btn btn-secondary" id="btn-cam">▶ Start Camera</button>
+      <p style="font-size:.72rem;color:var(--muted);line-height:1.5;margin-top:4px">
+        Swap runs as fast as the server allows (~0.5–2s per frame on CPU).
+        Good lighting = better swaps.
+      </p>
+    </div>
+
+    <!-- Image tab info -->
+    <div class="section hidden" id="img-section">
+      <div class="section-title">Photo Mode</div>
+      <p style="font-size:.76rem;color:var(--muted);line-height:1.5">
+        Drop a photo, then click <strong style="color:var(--text)">Swap Face</strong>.<br>
+        Takes 5–15 s on CPU.
+      </p>
+    </div>
+
+    <!-- ── YOUR FACE (custom paste mode) ── -->
+    <div class="section">
+      <div class="section-title">Your Face (pick any photo)</div>
+
+      <div class="face-thumb-wrap" id="face-thumb-wrap">
+        <img class="face-thumb" id="face-thumb" src="" alt="Target face">
+        <div class="face-thumb-info">
+          <strong>✓ Face ready</strong>
+          Using paste mode
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="btn-pick-face">📷 Pick face from gallery</button>
+      <button class="btn btn-danger" id="btn-clear-face" style="display:none">✕ Remove face</button>
+      <input type="file" id="face-file-input" accept="image/*" style="display:none">
+      <div id="face-alert" class="alert alert-hidden"></div>
+      <p style="font-size:.72rem;color:var(--muted);line-height:1.5;margin-top:4px">
+        <strong style="color:var(--success)">Smoothest option on CPU</strong> — a photo's face is pasted onto your
+        camera feed. Runs ~12× lighter than a DFM model, so it stays fluid. Overrides the DFM model below.
+      </p>
+    </div>
+
+    <!-- ── DFM model (fallback) ── -->
+    <div class="section">
+      <div class="section-title">DFM Model (celebrity preset)</div>
+      <p style="font-size:.72rem;color:var(--muted);line-height:1.5;margin:-4px 0 8px">
+        Tracks your expressions for a truer swap, but runs a neural network every frame —
+        <strong style="color:var(--warn)">heavier on CPU (~0.4s/frame), so it lags more</strong>.
+        For real-time smoothness, use a picked photo above (or a GPU).
+      </p>
+      <select class="model-select" id="model-select">
+        <option value="">— Select a model —</option>
+      </select>
+      <button class="btn btn-secondary" id="btn-load" disabled>⬇ Load Model</button>
+      <button class="btn btn-danger" id="btn-unload" style="display:none">✕ Unload</button>
+      <div class="progress-wrap" id="progress-wrap" style="display:none">
+        <div class="progress-label">
+          <span id="progress-text">Downloading…</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+      </div>
+      <div id="model-alert" class="alert alert-hidden"></div>
+    </div>
+
+    <!-- ── Video Call (WebRTC) ── -->
+    <div class="section">
+      <div class="section-title">Love Call App 💜</div>
+      <p style="font-size:.72rem;color:var(--muted);line-height:1.5;margin-bottom:8px">
+        Start a call → share the link → they see your swapped face live.
+      </p>
+      <button class="btn btn-primary" id="btn-start-call">📞 Start Video Call</button>
+      <button class="btn btn-danger" id="btn-end-call" style="display:none">📵 End Call</button>
+      <div class="call-link-box" id="call-link-box"></div>
+      <button class="btn btn-secondary" id="btn-copy-link" style="display:none">📋 Copy Link</button>
+      <div id="call-alert" class="alert alert-hidden"></div>
+    </div>
+
+    <!-- ── Voice Changer ── -->
+    <div class="section">
+      <div class="section-title">Voice Changer 🎙️</div>
+      <p style="font-size:.72rem;color:var(--muted);line-height:1.5;margin-bottom:8px">
+        Disguise your voice on calls — this changes the audio the other person hears.
+      </p>
+      <div class="toggle-row">
+        <span>Voice changer</span>
+        <label class="toggle"><input type="checkbox" id="toggle-voice"><div class="toggle-slider"></div></label>
+      </div>
+      <div id="voice-controls" style="display:none">
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin:10px 0">
+          <button class="btn btn-secondary vp" data-mode="pitch" data-pitch="5">👩 Female</button>
+          <button class="btn btn-secondary vp" data-mode="pitch" data-pitch="-7">🐻 Deep</button>
+          <button class="btn btn-secondary vp" data-mode="pitch" data-pitch="7">🐿️ Chipmunk</button>
+          <button class="btn btn-secondary vp" data-mode="robot" data-pitch="0">🤖 Robot</button>
+          <button class="btn btn-secondary vp" data-mode="pitch" data-pitch="0">🙂 Normal</button>
+        </div>
+        <div class="slider-row">
+          <label>Pitch <span id="voice-pitch-val">0</span> semitones</label>
+          <input type="range" id="sl-voice-pitch" min="-12" max="12" step="1" value="0">
+        </div>
+        <button class="btn btn-secondary" id="btn-voice-test">🎧 Test my voice (3s)</button>
+      </div>
+      <div id="voice-alert" class="alert alert-hidden"></div>
+    </div>
+
+    <!-- ── Settings ── -->
+    <div class="section">
+      <div class="section-title">Settings</div>
+      <div class="toggle-row">
+        <span>Face Swap Enabled</span>
+        <label class="toggle"><input type="checkbox" id="toggle-enabled" checked><div class="toggle-slider"></div></label>
+      </div>
+      <div class="slider-row">
+        <label>Morph Factor <span id="morph-val">0.75</span></label>
+        <input type="range" id="sl-morph" min="0" max="1" step="0.01" value="0.75">
+      </div>
+      <div class="slider-row">
+        <label>Face Opacity <span id="opacity-val">1.00</span></label>
+        <input type="range" id="sl-opacity" min="0" max="1" step="0.01" value="1.0">
+      </div>
+      <div class="select-row">
+        <label>Color Transfer (DFM mode)</label>
+        <select id="sel-color">
+          <option value="rct" selected>RCT (color-match)</option>
+          <option value="none">None</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">About</div>
+      <p style="font-size:.74rem;color:var(--muted);line-height:1.6">
+        CPU-only · Live ~1 FPS · Photo ~1–2s<br><br>
+        <strong style="color:var(--text)">Paste mode</strong>: pick any face photo → seamless blend onto your camera.<br>
+        <strong style="color:var(--text)">DFM mode</strong>: pre-trained celebrity models.
+      </p>
+    </div>
+  </aside>
+</main>
+
+<div class="stats-bar">
+  <span>Mode: <b id="stat-mode">—</b></span>
+  <span>RTT: <b id="stat-rtt">—</b></span>
+  <span>Model: <b id="stat-model">None</b></span>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────
+let modelLoaded = false;
+let targetFaceSet = false;
+let activeTab = 'cam';
+let currentPhotoFile = null;
+let swapRequestVersion = 0;
+
+function isReady() { return modelLoaded || targetFaceSet; }
+
+function updateBanner() {
+  document.getElementById('model-banner').classList.toggle('hidden', isReady());
+  updateCamLabel();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Socket
+// ─────────────────────────────────────────────────────────────────────
+const socket = io({ transports: ['websocket', 'polling'] });
+const $dot = document.getElementById('conn-dot');
+
+socket.on('connect', () => {
+  $dot.classList.add('on');
+  document.getElementById('conn-label').textContent = 'Connected';
+  pollStatus();
+});
+socket.on('disconnect', () => {
+  $dot.classList.remove('on');
+  document.getElementById('conn-label').textContent = 'Disconnected';
+  stopCamera();
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Tabs
+// ─────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    const tab = t.dataset.tab;
+    if (tab === activeTab) return;
+    activeTab = tab;
+    document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+    document.getElementById('tab-cam').classList.toggle('hidden', tab !== 'cam');
+    document.getElementById('tab-img').classList.toggle('hidden', tab !== 'img');
+    document.getElementById('cam-section').classList.toggle('hidden', tab !== 'cam');
+    document.getElementById('img-section').classList.toggle('hidden', tab !== 'img');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Canvas-based webcam display — NO double-image
+// ─────────────────────────────────────────────────────────────────────
+const video         = document.getElementById('webcam');
+const displayCanvas = document.getElementById('display-canvas');
+const ctx           = displayCanvas.getContext('2d');
+const $btnCam       = document.getElementById('btn-cam');
+const $vidLabel     = document.getElementById('vid-label');
+const $procRing     = document.getElementById('proc-ring');
+const $noFaceCam    = document.getElementById('no-face-cam');
+const $modeBadge    = document.getElementById('mode-badge');
+
+let stream = null, capturing = false;
+let inFlightWatchdog = null;
+let inFlight = false, lastSend = 0;
+
+// swapResultImg: holds the latest server-rendered swap frame.
+// Once we have a swap result we ALWAYS show it (no timeout fade-back to live).
+// Before first swap: show live video.
+let swapResultImg = null;   // Image object of latest swap
+let everSwapped   = false;  // true once we've received at least one good swap
+
+let rttSamples = [];
+let animReq = null;
+let noFaceTimer = null;
+
+// ── Animation loop — single canvas, no double-image ──
+function drawLoop() {
+  animReq = requestAnimationFrame(drawLoop);
+  if (!stream || !capturing) return;
+
+  // Sync canvas resolution to live video (once)
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (vw && (displayCanvas.width !== vw || displayCanvas.height !== vh)) {
+    displayCanvas.width  = vw;
+    displayCanvas.height = vh;
+  }
+  if (!vw) return;
+
+  if (everSwapped && swapResultImg) {
+    // Always show the latest swap frame — updated every server round-trip (~150-300 ms)
+    ctx.drawImage(swapResultImg, 0, 0, displayCanvas.width, displayCanvas.height);
+  } else {
+    // Show live video until first swap arrives
+    if (video.readyState >= 2) {
+      ctx.drawImage(video, 0, 0, displayCanvas.width, displayCanvas.height);
+    }
+  }
+}
+
+$btnCam.addEventListener('click', async () => {
+  if (stream) { stopCamera(); return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    $btnCam.textContent = '⏹ Stop Camera';
+    capturing = true;
+    drawLoop();
+    // Kick off the first frame immediately — subsequent sends happen
+    // right after each response so we run as fast as the server allows.
+    sendFrame();
+    updateCamLabel();
+  } catch(e) { alert('Camera error: ' + e.message); }
+});
+
+function updateCamLabel() {
+  if (!stream) return;
+  $vidLabel.textContent = isReady()
+    ? 'LIVE — swapping…'
+    : 'LIVE — load a model or pick a face to swap';
+}
+
+function stopCamera() {
+  capturing = false;
+  if (animReq)          { cancelAnimationFrame(animReq); animReq = null; }
+  if (inFlightWatchdog) { clearTimeout(inFlightWatchdog); inFlightWatchdog = null; }
+  if (noFaceTimer)      { clearTimeout(noFaceTimer); noFaceTimer = null; }
+  if (stream)           { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.srcObject = null;
+  swapResultImg = null;
+  everSwapped   = false;
+  inFlight      = false;
+  $procRing.classList.remove('active');
+  $noFaceCam.classList.remove('visible');
+  $modeBadge.style.display = 'none';
+  $btnCam.textContent = '▶ Start Camera';
+  $vidLabel.textContent = 'Start camera →';
+  ctx.clearRect(0, 0, displayCanvas.width, displayCanvas.height);
+}
+
+// Capture source: hidden <video> element (NOT the display canvas — avoids feedback loop)
+const captureCanvas = document.createElement('canvas');
+const captureCtx    = captureCanvas.getContext('2d');
+
+// Safety watchdog — reset inFlight if the server goes silent, so we never wedge.
+function armWatchdog() {
+  if (inFlightWatchdog) clearTimeout(inFlightWatchdog);
+  inFlightWatchdog = setTimeout(() => {
+    inFlight = false;
+    $procRing.classList.remove('active');
+    if (capturing) sendFrame();
+  }, 15000);
+}
+
+function sendFrame() {
+  if (!capturing || !stream || inFlight || video.readyState < 2) {
+    // Retry in 100 ms if video not ready yet
+    if (capturing) setTimeout(sendFrame, 100);
+    return;
+  }
+  if (!isReady()) {
+    // No model/face loaded — show live video, retry when something loads
+    setTimeout(sendFrame, 500);
+    return;
+  }
+
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  // Scale to max 320px — fastest server processing, still enough for good detection
+  const scale = Math.min(1, 320 / Math.max(vw, vh));
+  captureCanvas.width  = Math.round(vw * scale);
+  captureCanvas.height = Math.round(vh * scale);
+  captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+  inFlight = true;
+  lastSend = performance.now();
+  $procRing.classList.add('active');
+  armWatchdog();   // arm up front so inFlight ALWAYS recovers, even if the async encode below never fires
+
+  // Encode OFF the main thread (toBlob is async) and send the JPEG as raw
+  // binary — this drops the synchronous toDataURL jank AND the ~33% base64
+  // tax, which is what made the round-trip feel laggy on mobile. Every failure
+  // path falls back to base64 so older iOS Safari can never wedge the loop.
+  const fallback = () => { try { socket.emit('frame', { image: captureCanvas.toDataURL('image/jpeg', 0.55) }); } catch (e) {} armWatchdog(); };
+  if (captureCanvas.toBlob) {
+    captureCanvas.toBlob(blob => {
+      if (!blob) { fallback(); return; }
+      try {
+        if (typeof blob.arrayBuffer !== 'function') { fallback(); return; }
+        blob.arrayBuffer().then(buf => { socket.emit('frame', buf); armWatchdog(); }).catch(fallback);
+      } catch (e) { fallback(); }
+    }, 'image/jpeg', 0.55);
+  } else {
+    fallback();
+  }
+}
+
+socket.on('frame_result', data => {
+  if (inFlightWatchdog) { clearTimeout(inFlightWatchdog); inFlightWatchdog = null; }
+  const rtt = performance.now() - lastSend;
+  rttSamples.push(rtt);
+  if (rttSamples.length > 8) rttSamples.shift();
+  document.getElementById('stat-rtt').textContent =
+    Math.round(rttSamples.reduce((a, b) => a + b, 0) / rttSamples.length) + 'ms';
+
+  inFlight = false;
+  $procRing.classList.remove('active');
+
+  if (data.face_found && data.image) {
+    $noFaceCam.classList.remove('visible');
+    if (noFaceTimer) { clearTimeout(noFaceTimer); noFaceTimer = null; }
+    // Decode swap result off the main thread; drawLoop picks it up immediately.
+    const payload = data.image;
+    if (typeof payload === 'string') {
+      const img = new Image();                        // legacy base64 data-URL path
+      img.onload = () => { swapResultImg = img; everSwapped = true; };
+      img.src = payload;
+    } else {
+      const blob = new Blob([payload], { type: 'image/jpeg' });   // binary JPEG
+      const viaUrl = () => {                            // universal fallback decode
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload  = () => { swapResultImg = img; everSwapped = true; URL.revokeObjectURL(url); };
+        img.onerror = () => URL.revokeObjectURL(url);
+        img.src = url;
+      };
+      if (window.createImageBitmap) {
+        createImageBitmap(blob).then(bmp => {
+          if (swapResultImg && swapResultImg.close) swapResultImg.close();
+          swapResultImg = bmp; everSwapped = true;
+        }).catch(viaUrl);                              // fall back instead of swallowing
+      } else {
+        viaUrl();
+      }
+    }
+  } else if (!data.face_found) {
+    // Show no-face warning briefly; keep showing last swap result if we have one
+    $noFaceCam.classList.add('visible');
+    if (noFaceTimer) clearTimeout(noFaceTimer);
+    noFaceTimer = setTimeout(() => $noFaceCam.classList.remove('visible'), 2500);
+  }
+
+  // Update mode badge
+  const mode = data.mode || 'none';
+  if (mode === 'paste') {
+    $modeBadge.textContent = '🟢 Face paste';
+    $modeBadge.className = 'paste';
+    $modeBadge.style.display = 'block';
+  } else if (mode === 'dfm') {
+    $modeBadge.textContent = '🟣 DFM swap';
+    $modeBadge.className = 'dfm';
+    $modeBadge.style.display = 'block';
+  } else {
+    $modeBadge.style.display = 'none';
+  }
+  document.getElementById('stat-mode').textContent = mode;
+
+  // ── Continuous-send: immediately kick off the next frame ──
+  // This is what eliminates the 900ms artificial delay — we run as fast
+  // as the server can respond (typically 150-400ms round-trip on CPU).
+  if (capturing) sendFrame();
+});
+
+socket.on('frame_error', () => {
+  if (inFlightWatchdog) { clearTimeout(inFlightWatchdog); inFlightWatchdog = null; }
+  inFlight = false;
+  $procRing.classList.remove('active');
+  // Retry after a short pause on error
+  if (capturing) setTimeout(sendFrame, 300);
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// YOUR FACE — custom target face (paste mode)
+// ─────────────────────────────────────────────────────────────────────
+const $btnPickFace   = document.getElementById('btn-pick-face');
+const $btnClearFace  = document.getElementById('btn-clear-face');
+const $faceFileInput = document.getElementById('face-file-input');
+const $faceThumbWrap = document.getElementById('face-thumb-wrap');
+const $faceThumb     = document.getElementById('face-thumb');
+const $faceAlert     = document.getElementById('face-alert');
+
+$btnPickFace.addEventListener('click', () => $faceFileInput.click());
+$faceFileInput.addEventListener('change', e => {
+  if (e.target.files[0]) uploadTargetFace(e.target.files[0]);
+});
+
+async function uploadTargetFace(file) {
+  showAlert($faceAlert, 'info', 'Detecting face…');
+  $btnPickFace.disabled = true;
+
+  const fd = new FormData();
+  fd.append('image', file);
+  try {
+    const res  = await fetch('/api/target_face', { method: 'POST', body: fd });
+    const data = await res.json();
+    $btnPickFace.disabled = false;
+
+    if (!data.ok || data.error) {
+      showAlert($faceAlert, 'error', data.error || 'Upload failed');
+      return;
+    }
+    if (!data.face_found) {
+      showAlert($faceAlert, 'warn', 'No face detected in that photo. Try a clear front-facing shot.');
+      return;
+    }
+
+    // Show thumbnail
+    $faceThumb.src = URL.createObjectURL(file);
+    $faceThumbWrap.classList.add('visible');
+    $btnClearFace.style.display = 'block';
+    targetFaceSet = true;
+    updateBanner();
+    showAlert($faceAlert, 'success', '✓ Face loaded! Start camera to see the swap.');
+    document.getElementById('stat-model').textContent = 'Paste';
+  } catch(e) {
+    $btnPickFace.disabled = false;
+    showAlert($faceAlert, 'error', 'Error: ' + e.message);
+  }
+}
+
+$btnClearFace.addEventListener('click', async () => {
+  await fetch('/api/target_face', { method: 'DELETE' });
+  targetFaceSet = false;
+  $faceThumbWrap.classList.remove('visible');
+  $faceThumb.src = '';
+  $btnClearFace.style.display = 'none';
+  $faceFileInput.value = '';
+  updateBanner();
+  showAlert($faceAlert, 'info', 'Face removed. DFM model will be used if loaded.');
+  if (!modelLoaded) document.getElementById('stat-model').textContent = 'None';
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Image Upload — two-step flow
+// ─────────────────────────────────────────────────────────────────────
+const $dropZone       = document.getElementById('drop-zone');
+const $fileInput      = document.getElementById('file-input');
+const $uploadPane     = document.getElementById('upload-pane');
+const $imgPreviewPane = document.getElementById('img-preview-pane');
+const $imgOriginal    = document.getElementById('img-original');
+const $imgSwapped     = document.getElementById('img-swapped');
+const $imgProc        = document.getElementById('img-processing');
+const $noFace         = document.getElementById('no-face-msg');
+const $uploadAlert    = document.getElementById('upload-alert');
+const $imgResultAlert = document.getElementById('img-result-alert');
+const $btnNewPhoto    = document.getElementById('btn-new-photo');
+const $btnDownload    = document.getElementById('btn-download');
+const $btnSwapPhoto   = document.getElementById('btn-swap-photo');
+
+$btnSwapPhoto.disabled = true;
+
+$dropZone.addEventListener('click', () => $fileInput.click());
+$fileInput.addEventListener('change', e => { if (e.target.files[0]) loadPhotoPreview(e.target.files[0]); });
+$dropZone.addEventListener('dragover', e => { e.preventDefault(); $dropZone.classList.add('over'); });
+$dropZone.addEventListener('dragleave', () => $dropZone.classList.remove('over'));
+$dropZone.addEventListener('drop', e => {
+  e.preventDefault(); $dropZone.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) loadPhotoPreview(f);
+});
+document.getElementById('tab-img').addEventListener('dragover', e => e.preventDefault());
+document.getElementById('tab-img').addEventListener('drop', e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) loadPhotoPreview(f);
+});
+
+function loadPhotoPreview(file) {
+  currentPhotoFile = file;
+  $imgOriginal.src = URL.createObjectURL(file);
+  $imgSwapped.src = ''; $imgSwapped.style.opacity = '.1';
+  $noFace.classList.remove('active');
+  $imgProc.classList.remove('active');
+  $btnDownload.classList.add('hidden');
+  $imgResultAlert.className = 'alert alert-hidden';
+
+  $uploadPane.classList.add('hidden');
+  $imgPreviewPane.classList.remove('hidden');
+  $btnSwapPhoto.disabled = !isReady();
+
+  if (isReady()) {
+    setTimeout(() => swapPhoto(), 200);
+  } else {
+    showAlert($imgResultAlert, 'warn', '⚠️ Upload a face or load a model first, then click Swap Face.');
+  }
+}
+
+$btnSwapPhoto.addEventListener('click', () => {
+  if (!currentPhotoFile) return;
+  if (!isReady()) { pulseBanner(); return; }
+  swapPhoto();
+});
+
+async function swapPhoto() {
+  if (!currentPhotoFile) return;
+  $noFace.classList.remove('active');
+  $btnDownload.classList.add('hidden');
+  $imgResultAlert.className = 'alert alert-hidden';
+  $imgSwapped.style.opacity = '.1';
+  $imgProc.classList.add('active');
+  $btnSwapPhoto.disabled = true;
+
+  const myVersion = ++swapRequestVersion;
+  const fd = new FormData();
+  fd.append('image', currentPhotoFile);
+  try {
+    const res  = await fetch('/api/process_image', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (myVersion !== swapRequestVersion) return;
+    $imgProc.classList.remove('active');
+    $btnSwapPhoto.disabled = false;
+
+    if (data.error) {
+      showAlert($imgResultAlert, 'error', data.error);
+    } else if (!data.face_found) {
+      $noFace.classList.add('active');
+    } else {
+      $imgSwapped.src = data.image;
+      $imgSwapped.style.opacity = '1';
+      $btnDownload.href = data.image;
+      $btnDownload.classList.remove('hidden');
+      showAlert($imgResultAlert, 'success', '✓ Done! (' + (data.mode || '') + ' mode)');
+    }
+  } catch(e) {
+    if (myVersion !== swapRequestVersion) return;
+    $imgProc.classList.remove('active');
+    $btnSwapPhoto.disabled = false;
+    showAlert($imgResultAlert, 'error', 'Error: ' + e.message);
+  }
+}
+
+$btnNewPhoto.addEventListener('click', () => {
+  currentPhotoFile = null;
+  $uploadPane.classList.remove('hidden');
+  $imgPreviewPane.classList.add('hidden');
+  $imgOriginal.src = ''; $imgSwapped.src = '';
+  $fileInput.value = '';
+  $btnDownload.classList.add('hidden');
+  $imgResultAlert.className = 'alert alert-hidden';
+  $fileInput.click();
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// DFM Models
+// ─────────────────────────────────────────────────────────────────────
+const $sel        = document.getElementById('model-select');
+const $btnLoad    = document.getElementById('btn-load');
+const $btnUnload  = document.getElementById('btn-unload');
+const $progWrap   = document.getElementById('progress-wrap');
+const $progFill   = document.getElementById('progress-fill');
+const $progPct    = document.getElementById('progress-pct');
+const $progText   = document.getElementById('progress-text');
+const $modelAlert = document.getElementById('model-alert');
+const $statModel  = document.getElementById('stat-model');
+
+async function loadModelList() {
+  try {
+    const models = await (await fetch('/api/models')).json();
+    $sel.innerHTML = '<option value="">— Select a model —</option>';
+    let firstReady = '';
+    models.forEach(m => {
+      const o = document.createElement('option');
+      o.value = m.name;
+      o.textContent = m.name + (m.downloaded ? ' ✓' : '');
+      $sel.appendChild(o);
+      if (m.downloaded && !firstReady) firstReady = m.name;
+    });
+    if (!modelLoaded && firstReady) {
+      $sel.value = firstReady;
+      $btnLoad.disabled = false;
+      showAlert($modelAlert, 'info', '✓ Model file ready — click Load Model.');
+    }
+  } catch(e) {}
+}
+loadModelList();
+
+$sel.addEventListener('change', () => {
+  $btnLoad.disabled = !$sel.value;
+  $modelAlert.className = 'alert alert-hidden';
+});
+
+$btnLoad.addEventListener('click', async () => {
+  const name = $sel.value; if (!name) return;
+  $btnLoad.disabled = true;
+  $progWrap.style.display = 'block';
+  $progFill.style.width = '0%'; $progPct.textContent = '0%';
+  $progText.textContent = 'Loading…';
+  $modelAlert.className = 'alert alert-hidden';
+  await fetch('/api/model/load', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name}) });
+  pollModelStatus();
+});
+
+$btnUnload.addEventListener('click', async () => {
+  await fetch('/api/model/unload', { method:'POST' });
+  $btnUnload.style.display = 'none';
+  $btnLoad.disabled = !$sel.value;
+  modelLoaded = false;
+  $statModel.textContent = targetFaceSet ? 'Paste' : 'None';
+  updateBanner();
+  showAlert($modelAlert, 'info', 'Model unloaded.');
+});
+
+let statusPoll = null;
+function pollModelStatus() {
+  if (statusPoll) clearInterval(statusPoll);
+  statusPoll = setInterval(async () => {
+    try {
+      const s = await (await fetch('/api/model/status')).json();
+      if (s.loading) {
+        const pct = Math.round(s.progress || 0);
+        $progFill.style.width = pct + '%'; $progPct.textContent = pct + '%';
+        $progText.textContent = pct < 5 ? 'Loading…' : 'Downloading…';
+      } else if (s.error) {
+        clearInterval(statusPoll);
+        $progWrap.style.display = 'none';
+        showAlert($modelAlert, 'error', s.error);
+        $btnLoad.disabled = false;
+      } else if (s.current) {
+        clearInterval(statusPoll);
+        $progWrap.style.display = 'none';
+        $btnUnload.style.display = 'block';
+        modelLoaded = true;
+        $statModel.textContent = s.current;
+        updateBanner();
+        $btnSwapPhoto.disabled = false;
+        showAlert($modelAlert, 'success', '✓ "' + s.current + '" ready!');
+        loadModelList();
+      }
+    } catch(e) {}
+  }, 500);
+}
+
+function pollStatus() {
+  fetch('/api/model/status').then(r => r.json()).then(s => {
+    // Restore model state
+    if (s.current) {
+      modelLoaded = true;
+      $statModel.textContent = s.current;
+      $btnUnload.style.display = 'block';
+      $btnLoad.disabled = true;
+      if ($sel.value !== s.current) $sel.value = s.current;
+      $btnSwapPhoto.disabled = false;
+      showAlert($modelAlert, 'success', '✓ "' + s.current + '" already loaded!');
+    }
+    // Restore target face state (paste mode survives page refresh if server kept it)
+    if (s.target_face_set) {
+      targetFaceSet = true;
+      $faceThumbWrap.classList.add('visible');
+      $btnClearFace.style.display = 'block';
+      if (!s.current) $statModel.textContent = 'Paste';
+      $btnSwapPhoto.disabled = false;
+      showAlert($faceAlert, 'info', '✓ Custom face still active from last session.');
+    }
+    updateBanner();
+    if (s.loading) pollModelStatus();
+  }).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Video Call — WebRTC
+// ─────────────────────────────────────────────────────────────────────
+const $btnStartCall = document.getElementById('btn-start-call');
+const $btnEndCall   = document.getElementById('btn-end-call');
+const $callLinkBox  = document.getElementById('call-link-box');
+const $btnCopyLink  = document.getElementById('btn-copy-link');
+const $callAlert    = document.getElementById('call-alert');
+
+let rtcConn   = null;
+let callRoomId = null;
+let callVideoStream = null;
+
+$btnStartCall.addEventListener('click', async () => {
+  if (!isReady()) { pulseBanner(); return; }
+  if (!stream) {
+    showAlert($callAlert, 'warn', 'Start the camera first, then begin the call.');
+    return;
+  }
+  try {
+    await startCall();
+  } catch(e) {
+    showAlert($callAlert, 'error', 'WebRTC error: ' + e.message);
+  }
+});
+
+async function startCall() {
+  const roomId = Math.random().toString(36).substring(2, 10);
+  callRoomId = roomId;
+
+  const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' },
+                                  { urls: 'stun:stun1.l.google.com:19302' }] };
+  rtcConn = new RTCPeerConnection(config);
+
+  // Capture swapped video from the display canvas
+  const canvasStream = displayCanvas.captureStream(15);
+  callVideoStream = canvasStream;
+  canvasStream.getVideoTracks().forEach(t => rtcConn.addTrack(t, canvasStream));
+
+  // Add microphone audio (with the voice changer applied if enabled)
+  try {
+    const voiceTrack = await ensureVoiceTrack();
+    if (voiceTrack) rtcConn.addTrack(voiceTrack, voiceOutStream);
+  } catch (e) {
+    showAlert($callAlert, 'warn', 'Mic unavailable — starting a video-only call.');
+  }
+
+  rtcConn.onicecandidate = e => {
+    if (e.candidate) socket.emit('webrtc_ice', { room_id: roomId, candidate: e.candidate });
+  };
+  rtcConn.onconnectionstatechange = () => {
+    const s = rtcConn.connectionState;
+    if (s === 'connected') showAlert($callAlert, 'success', '✓ Connected! They can see your swapped face.');
+    if (s === 'disconnected' || s === 'failed') showAlert($callAlert, 'warn', 'Connection lost.');
+  };
+
+  const offer = await rtcConn.createOffer({ offerToReceiveVideo: false });
+  await rtcConn.setLocalDescription(offer);
+  socket.emit('webrtc_offer', { room_id: roomId, offer: offer });
+}
+
+socket.on('offer_stored', data => {
+  const link = location.origin + '/call/' + data.room_id;
+  $callLinkBox.textContent = link;
+  $callLinkBox.classList.add('visible');
+  $btnCopyLink.style.display = 'block';
+  $btnStartCall.style.display = 'none';
+  $btnEndCall.style.display = 'block';
+  showAlert($callAlert, 'info', '🔗 Share the link above — they\'ll see your swapped face!');
+});
+
+socket.on('call_error', data => {
+  showAlert($callAlert, 'error', (data && data.message) || 'Call could not be started.');
+});
+
+socket.on('webrtc_answer', async data => {
+  if (rtcConn && data.answer) {
+    try { await rtcConn.setRemoteDescription(data.answer); } catch(e) {}
+  }
+});
+
+socket.on('webrtc_ice', async data => {
+  if (rtcConn && data.candidate) {
+    try { await rtcConn.addIceCandidate(data.candidate); } catch(e) {}
+  }
+});
+
+$btnEndCall.addEventListener('click', () => {
+  if (callRoomId) socket.emit('end_call', { room_id: callRoomId });
+  if (rtcConn) { rtcConn.close(); rtcConn = null; }
+  if (callVideoStream) { callVideoStream.getTracks().forEach(t => t.stop()); callVideoStream = null; }
+  if (!voiceEnabled) teardownVoice();   // release the mic unless the changer is actively on
+  callRoomId = null;
+  $callLinkBox.classList.remove('visible');
+  $btnCopyLink.style.display = 'none';
+  $btnStartCall.style.display = 'block';
+  $btnEndCall.style.display = 'none';
+  $callAlert.className = 'alert alert-hidden';
+});
+
+$btnCopyLink.addEventListener('click', () => {
+  navigator.clipboard.writeText($callLinkBox.textContent).then(() => {
+    $btnCopyLink.textContent = '✓ Copied!';
+    setTimeout(() => $btnCopyLink.textContent = '📋 Copy Link', 2000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Settings
+// ─────────────────────────────────────────────────────────────────────
+function post(url, d) {
+  fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(d) });
+}
+document.getElementById('sl-morph').addEventListener('input', e => {
+  const v = parseFloat(e.target.value).toFixed(2);
+  document.getElementById('morph-val').textContent = v;
+  post('/api/settings', { morph_factor: parseFloat(v) });
+});
+document.getElementById('sl-opacity').addEventListener('input', e => {
+  const v = parseFloat(e.target.value).toFixed(2);
+  document.getElementById('opacity-val').textContent = v;
+  post('/api/settings', { face_opacity: parseFloat(v) });
+});
+document.getElementById('sel-color').addEventListener('change', e =>
+  post('/api/settings', { color_transfer: e.target.value }));
+document.getElementById('toggle-enabled').addEventListener('change', e =>
+  post('/api/settings', { enabled: e.target.checked }));
+
+// ─────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────
+function showAlert(el, type, msg) { el.className = `alert alert-${type}`; el.textContent = msg; }
+function pulseBanner() {
+  const b = document.getElementById('model-banner');
+  b.style.transition = 'background .15s'; b.style.background = 'rgba(245,158,11,.35)';
+  setTimeout(() => b.style.background = '', 400);
+}
+</script>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────
+// Voice Changer — real-time, client-side (Web Audio API)
+// Pitch shift uses the "Jungle" granular delay-line algorithm (no tempo
+// change); robot mode uses an audio-rate ring modulator. Runs entirely in
+// the browser, so it adds ZERO load to the swap server.
+// ─────────────────────────────────────────────────────────────────────
+const VOICE_DELAY = 0.100, VOICE_FADE = 0.050, VOICE_BUF = 0.100;
+
+function vCreateFadeBuffer(ctx, activeTime, fadeTime) {
+  const len1 = activeTime * ctx.sampleRate;
+  const len2 = (activeTime - 2 * fadeTime) * ctx.sampleRate;
+  const length = Math.floor(len1 + len2);
+  const buf = ctx.createBuffer(1, length, ctx.sampleRate);
+  const p = buf.getChannelData(0);
+  const fadeLen = fadeTime * ctx.sampleRate;
+  const idx2 = len1 - fadeLen;
+  for (let i = 0; i < len1; ++i) {
+    if (i < fadeLen)       p[i] = Math.sqrt(i / fadeLen);
+    else if (i >= idx2)    p[i] = Math.sqrt(1 - (i - idx2) / fadeLen);
+    else                   p[i] = 1;
+  }
+  for (let i = Math.floor(len1); i < length; ++i) p[i] = 0;
+  return buf;
+}
+function vCreateDelayBuffer(ctx, activeTime, fadeTime, shiftUp) {
+  const len1 = activeTime * ctx.sampleRate;
+  const len2 = (activeTime - 2 * fadeTime) * ctx.sampleRate;
+  const length = Math.floor(len1 + len2);
+  const buf = ctx.createBuffer(1, length, ctx.sampleRate);
+  const p = buf.getChannelData(0);
+  for (let i = 0; i < len1; ++i) p[i] = shiftUp ? (len1 - i) / length : i / len1;
+  for (let i = Math.floor(len1); i < length; ++i) p[i] = 0;
+  return buf;
+}
+function Jungle(ctx) {
+  this.context = ctx;
+  const input = ctx.createGain(), output = ctx.createGain();
+  const mod1 = ctx.createBufferSource(), mod2 = ctx.createBufferSource();
+  const mod3 = ctx.createBufferSource(), mod4 = ctx.createBufferSource();
+  const down = vCreateDelayBuffer(ctx, VOICE_BUF, VOICE_FADE, false);
+  const up   = vCreateDelayBuffer(ctx, VOICE_BUF, VOICE_FADE, true);
+  mod1.buffer = down; mod2.buffer = down; mod3.buffer = up; mod4.buffer = up;
+  mod1.loop = mod2.loop = mod3.loop = mod4.loop = true;
+
+  const mod1Gain = ctx.createGain(), mod2Gain = ctx.createGain();
+  const mod3Gain = ctx.createGain(), mod4Gain = ctx.createGain();
+  mod3Gain.gain.value = 0; mod4Gain.gain.value = 0;
+  mod1.connect(mod1Gain); mod2.connect(mod2Gain);
+  mod3.connect(mod3Gain); mod4.connect(mod4Gain);
+
+  const modGain1 = ctx.createGain(), modGain2 = ctx.createGain();
+  const delay1 = ctx.createDelay(), delay2 = ctx.createDelay();
+  mod1Gain.connect(modGain1); mod2Gain.connect(modGain2);
+  mod3Gain.connect(modGain1); mod4Gain.connect(modGain2);
+  modGain1.connect(delay1.delayTime); modGain2.connect(delay2.delayTime);
+
+  const fade1 = ctx.createBufferSource(), fade2 = ctx.createBufferSource();
+  const fadeBuf = vCreateFadeBuffer(ctx, VOICE_BUF, VOICE_FADE);
+  fade1.buffer = fadeBuf; fade2.buffer = fadeBuf; fade1.loop = true; fade2.loop = true;
+  const mix1 = ctx.createGain(), mix2 = ctx.createGain();
+  mix1.gain.value = 0; mix2.gain.value = 0;
+  fade1.connect(mix1.gain); fade2.connect(mix2.gain);
+
+  input.connect(delay1); input.connect(delay2);
+  delay1.connect(mix1); delay2.connect(mix2);
+  mix1.connect(output); mix2.connect(output);
+
+  const t = ctx.currentTime + 0.05, t2 = t + VOICE_BUF - VOICE_FADE;
+  mod1.start(t); mod2.start(t2); mod3.start(t); mod4.start(t2);
+  fade1.start(t); fade2.start(t2);
+
+  this.input = input; this.output = output;
+  this.mod1Gain = mod1Gain; this.mod2Gain = mod2Gain;
+  this.mod3Gain = mod3Gain; this.mod4Gain = mod4Gain;
+  this.modGain1 = modGain1; this.modGain2 = modGain2;
+  this.setDelay(VOICE_DELAY);
+}
+Jungle.prototype.setDelay = function (d) {
+  this.modGain1.gain.setTargetAtTime(0.5 * d, 0, 0.01);
+  this.modGain2.gain.setTargetAtTime(0.5 * d, 0, 0.01);
+};
+Jungle.prototype.setPitchOffset = function (mult) {
+  const up = mult > 0 ? 1 : 0, down = mult > 0 ? 0 : 1;
+  this.mod1Gain.gain.value = down; this.mod2Gain.gain.value = down;
+  this.mod3Gain.gain.value = up;   this.mod4Gain.gain.value = up;
+  this.setDelay(VOICE_DELAY * Math.abs(mult));
+};
+
+let voiceCtx = null, voiceSource = null, voiceOut = null, voiceOutStream = null;
+let voiceJungle = null, voiceRingIn = null, voiceOsc = null;
+let voiceMicStream = null, voiceReady = false;
+let voiceEnabled = false, voiceMode = 'pitch', voicePitch = 0;
+
+async function resumeVoiceCtx() {
+  if (voiceCtx && voiceCtx.state === 'suspended') { try { await voiceCtx.resume(); } catch (e) {} }
+}
+async function ensureVoiceGraph() {
+  if (voiceReady) { await resumeVoiceCtx(); return; }
+  voiceMicStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+  const AC = window.AudioContext || window.webkitAudioContext;
+  voiceCtx = new AC();
+  voiceSource = voiceCtx.createMediaStreamSource(voiceMicStream);
+  voiceOut = voiceCtx.createMediaStreamDestination();
+  voiceOutStream = voiceOut.stream;
+  voiceJungle = new Jungle(voiceCtx);
+  voiceRingIn = voiceCtx.createGain(); voiceRingIn.gain.value = 0;   // ring-mod carrier
+  voiceOsc = voiceCtx.createOscillator(); voiceOsc.type = 'sine'; voiceOsc.frequency.value = 55;
+  voiceOsc.connect(voiceRingIn.gain); voiceOsc.start();
+  voiceReady = true;
+  applyVoiceRouting();
+  await resumeVoiceCtx();
+}
+async function ensureVoiceTrack() {
+  await ensureVoiceGraph();
+  return voiceOutStream ? voiceOutStream.getAudioTracks()[0] : null;
+}
+function applyVoiceRouting() {
+  if (!voiceReady) return;
+  try { voiceSource.disconnect(); } catch (e) {}
+  try { voiceJungle.output.disconnect(); } catch (e) {}
+  try { voiceRingIn.disconnect(); } catch (e) {}
+  const active = voiceEnabled && (voiceMode === 'robot' || (voiceMode === 'pitch' && voicePitch !== 0));
+  if (!active) { voiceSource.connect(voiceOut); return; }   // clean passthrough
+  if (voiceMode === 'robot') {
+    voiceSource.connect(voiceRingIn); voiceRingIn.connect(voiceOut);
+  } else {
+    voiceJungle.setPitchOffset(voicePitch / 12);
+    voiceSource.connect(voiceJungle.input); voiceJungle.output.connect(voiceOut);
+  }
+}
+function teardownVoice() {
+  // Fully release the microphone + audio graph so the mic indicator turns off
+  // and no capture lingers between calls / after the changer is disabled.
+  try { if (voiceOsc) voiceOsc.stop(); } catch (e) {}
+  if (voiceMicStream) voiceMicStream.getTracks().forEach(t => t.stop());
+  if (voiceCtx) { try { voiceCtx.close(); } catch (e) {} }
+  voiceCtx = voiceSource = voiceOut = voiceOutStream = null;
+  voiceJungle = voiceRingIn = voiceOsc = voiceMicStream = null;
+  voiceReady = false;
+}
+
+const $toggleVoice   = document.getElementById('toggle-voice');
+const $voiceControls = document.getElementById('voice-controls');
+const $slVoicePitch  = document.getElementById('sl-voice-pitch');
+const $voicePitchVal = document.getElementById('voice-pitch-val');
+const $voiceAlert    = document.getElementById('voice-alert');
+const $btnVoiceTest  = document.getElementById('btn-voice-test');
+
+$toggleVoice.addEventListener('change', async e => {
+  voiceEnabled = e.target.checked;
+  $voiceControls.style.display = voiceEnabled ? 'block' : 'none';
+  if (voiceEnabled) {
+    try {
+      await ensureVoiceGraph();
+      showAlert($voiceAlert, 'info', 'Ready — pick a preset or drag the pitch. It applies on your next/active call.');
+    } catch (err) {
+      voiceEnabled = false; $toggleVoice.checked = false; $voiceControls.style.display = 'none';
+      showAlert($voiceAlert, 'error', 'Microphone blocked: ' + err.message);
+      return;
+    }
+    applyVoiceRouting();
+  } else if (rtcConn) {
+    applyVoiceRouting();     // call active → keep the mic live, just clean passthrough
+  } else {
+    teardownVoice();         // idle → release the microphone entirely
+  }
+});
+
+document.querySelectorAll('.vp').forEach(b => b.addEventListener('click', () => {
+  voiceMode = b.dataset.mode;
+  voicePitch = parseInt(b.dataset.pitch, 10);
+  $slVoicePitch.value = voicePitch; $voicePitchVal.textContent = voicePitch;
+  applyVoiceRouting();
+  showAlert($voiceAlert, 'success', '✓ ' + b.textContent.trim() + ' voice selected.');
+}));
+
+$slVoicePitch.addEventListener('input', e => {
+  voicePitch = parseInt(e.target.value, 10); voiceMode = 'pitch';
+  $voicePitchVal.textContent = voicePitch;
+  applyVoiceRouting();
+});
+
+$btnVoiceTest.addEventListener('click', async () => {
+  try {
+    await ensureVoiceGraph(); await resumeVoiceCtx();
+    if (typeof MediaRecorder === 'undefined') {
+      showAlert($voiceAlert, 'warn', 'Preview not supported here, but it will still work on the call.');
+      return;
+    }
+    $btnVoiceTest.disabled = true;
+    showAlert($voiceAlert, 'info', '🎙️ Recording 3s… speak now!');
+    const rec = new MediaRecorder(voiceOutStream);
+    const chunks = [];
+    rec.ondataavailable = ev => chunks.push(ev.data);
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
+      const url = URL.createObjectURL(blob);
+      const a = new Audio(url);
+      showAlert($voiceAlert, 'success', '▶ Playing back your changed voice…');
+      a.play();
+      a.onended = () => {
+        URL.revokeObjectURL(url); $btnVoiceTest.disabled = false;
+        showAlert($voiceAlert, 'info', "That's how you'll sound to the other person.");
+      };
+    };
+    rec.start();
+    setTimeout(() => { if (rec.state !== 'inactive') rec.stop(); }, 3000);
+  } catch (err) {
+    $btnVoiceTest.disabled = false;
+    showAlert($voiceAlert, 'error', 'Mic error: ' + err.message);
+  }
+});
+</script>
+</body>
+</html>

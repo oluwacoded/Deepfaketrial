@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Love Call App</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #000;
+  color: #e2e8f0;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+#remote-video {
+  max-width: 100vw;
+  max-height: 85vh;
+  width: 100%;
+  object-fit: contain;
+  display: none;
+}
+#status {
+  text-align: center;
+  padding: 24px;
+}
+#status .icon { font-size: 3rem; margin-bottom: 16px; }
+#status h2 { font-size: 1.2rem; margin-bottom: 8px; }
+#status p { color: #8892a4; font-size: .86rem; }
+.bar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  background: rgba(15,17,23,.85);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(255,255,255,.07);
+  padding: 10px 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 10;
+}
+.bar .logo { font-size: 1rem; font-weight: 700;
+  background: linear-gradient(135deg,#6c63ff,#a78bfa);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #8892a4; margin-left: auto; }
+.dot.on { background: #22c55e; }
+#conn-txt { font-size: .78rem; color: #8892a4; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <div class="logo">Love Call App</div>
+  <div style="font-size:.72rem;color:#8892a4">Incoming call</div>
+  <div class="dot" id="cdot"></div>
+  <span id="conn-txt">Connecting…</span>
+</div>
+
+<div id="status">
+  <div class="icon" id="status-icon">📞</div>
+  <h2 id="status-h">Connecting to call…</h2>
+  <p id="status-p">Please wait while we establish the connection.</p>
+</div>
+
+<video id="remote-video" autoplay playsinline></video>
+
+<script>
+const roomId = {{ room_id | tojson }};
+const socket = io({ transports: ['websocket', 'polling'] });
+const $cdot  = document.getElementById('cdot');
+const $txt   = document.getElementById('conn-txt');
+const $icon  = document.getElementById('status-icon');
+const $h     = document.getElementById('status-h');
+const $p     = document.getElementById('status-p');
+const $video = document.getElementById('remote-video');
+const $status = document.getElementById('status');
+
+let rtcConn = null;
+
+function setStatus(icon, h, p) {
+  $icon.textContent = icon;
+  $h.textContent = h;
+  $p.textContent = p;
+  $status.style.display = 'block';
+}
+
+socket.on('connect', async () => {
+  $cdot.classList.add('on');
+  $txt.textContent = 'Connected';
+  await connect();
+});
+
+socket.on('disconnect', () => {
+  $cdot.classList.remove('on');
+  $txt.textContent = 'Disconnected';
+  setStatus('📵', 'Call ended', 'The connection was lost.');
+  $video.style.display = 'none';
+  $status.style.display = 'block';
+});
+
+socket.on('webrtc_ice', async data => {
+  if (rtcConn && data.candidate) {
+    try { await rtcConn.addIceCandidate(data.candidate); } catch(e) {}
+  }
+});
+
+async function connect() {
+  // Fetch the offer stored by the caller
+  let offer;
+  try {
+    const res = await fetch(`/api/room/${roomId}`);
+    const d   = await res.json();
+    if (d.error) {
+      setStatus('❌', 'Call not found', 'This link may have expired. Ask the caller to start a new call.');
+      return;
+    }
+    offer = d.offer;
+  } catch(e) {
+    setStatus('❌', 'Network error', e.message);
+    return;
+  }
+
+  const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' },
+                                  { urls: 'stun:stun1.l.google.com:19302' }] };
+  rtcConn = new RTCPeerConnection(config);
+
+  rtcConn.ontrack = e => {
+    $video.srcObject = e.streams[0];
+    $video.style.display = 'block';
+    $status.style.display = 'none';
+  };
+
+  rtcConn.onicecandidate = e => {
+    if (e.candidate) socket.emit('webrtc_ice', { room_id: roomId, candidate: e.candidate });
+  };
+
+  rtcConn.onconnectionstatechange = () => {
+    const s = rtcConn.connectionState;
+    if (s === 'connected') {
+      $cdot.style.background = '#22c55e';
+      $txt.textContent = 'Live';
+    }
+    if (s === 'disconnected' || s === 'failed') {
+      setStatus('📵', 'Call ended', 'The caller disconnected.');
+      $video.style.display = 'none';
+      $status.style.display = 'block';
+    }
+  };
+
+  try {
+    await rtcConn.setRemoteDescription(offer);
+    const answer = await rtcConn.createAnswer();
+    await rtcConn.setLocalDescription(answer);
+    socket.emit('webrtc_answer', { room_id: roomId, answer: answer });
+    setStatus('⏳', 'Waiting for video…', 'Connection established, receiving stream.');
+  } catch(e) {
+    setStatus('❌', 'Connection failed', e.message);
+  }
+}
+</script>
+</body>
+</html>
