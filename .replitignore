@@ -1,0 +1,20 @@
+# Keep the deployment build small. Replit ships ALL workspace files by default
+# (8 GB cap) and the publish was failing at the security-scan step on this repo's
+# size. Nothing below is needed to RUN the app.
+
+# Package / build caches (recreated automatically on deploy)
+.cache/
+__pycache__/
+*.pyc
+
+# Git history — huge here, and never needed at runtime
+.git/
+
+# DFM face-swap models download at runtime into userdata/models/
+# (the dir is auto-created on startup), so they must not ship in the build.
+userdata/
+*.dfm
+
+# Chat-uploaded screenshots / recordings — not referenced by the app
+attached_assets/
+*.mp4
