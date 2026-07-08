@@ -18,7 +18,7 @@ Pipeline stages (run on the GPU when available, else CPU):
 | File | Purpose |
 |------|---------|
 | `web_server.py` | Flask + SocketIO server, REST endpoints, WebSocket frame handler |
-| `web_pipeline.py` | Headless pipeline wrapper (no Qt, single-threaded CPU) |
+| `web_pipeline.py` | Headless pipeline wrapper (no Qt; runs on GPU when available, else CPU) |
 | `templates/index.html` | Single-page web UI |
 | `main.py` | Original CLI entry point (kept intact) |
 | `apps/DeepFaceLive/` | Original Qt desktop app (untouched) |
