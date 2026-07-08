@@ -52,6 +52,7 @@ def _pick_device():
 
 
 _device = _pick_device()
+_device_lock = threading.Lock()
 
 
 class FaceSwapPipeline:
@@ -96,7 +97,8 @@ class FaceSwapPipeline:
             print(f'[Pipeline] Detector init failed on {_device}: {e}')
             if not _device.is_cpu():
                 print('[Pipeline] Falling back to CPU...')
-                _device = _cpu_device
+                with _device_lock:
+                    _device = _cpu_device
                 try:
                     self._detector = YoloV5Face(_device)
                     print('[Pipeline] YoloV5Face detector ready on CPU (fallback).')
@@ -136,8 +138,8 @@ class FaceSwapPipeline:
                          args=(model_name,), daemon=True).start()
 
     def _load_model_thread(self, model_name: str):
-        from modelhub.DFLive.DFMModel import (DFMModelInitializer,
-                                               get_available_models_info)
+        global _device
+        from modelhub.DFLive.DFMModel import get_available_models_info
 
         try:
             infos = get_available_models_info(MODELS_DIR)
@@ -152,29 +154,32 @@ class FaceSwapPipeline:
                     self._model_load_error = f'Model "{model_name}" not found.'
                 return
 
-            # Use the generator-based initializer (handles download + load)
-            initializer = DFMModelInitializer(info, _device)
-            loaded = False
-            while not loaded:
-                events = initializer.process_events()
-                if events.new_status_downloading or events.prev_status_downloading:
-                    p = events.download_progress or self._model_load_progress
-                    with self._lock:
-                        self._model_load_progress = p if p is not None else self._model_load_progress
-                if events.new_status_initialized:
-                    with self._lock:
-                        self._dfm_model = events.dfm_model
-                        self._current_model_name = model_name
-                        self._model_load_progress = 100.0
-                    print(f'[Pipeline] Model "{model_name}" loaded.')
-                    loaded = True
-                elif events.new_status_error:
-                    with self._lock:
-                        self._model_load_error = events.error
-                    print(f'[Pipeline] Model load error: {events.error}')
-                    loaded = True
-                else:
-                    time.sleep(0.1)
+            device = _device
+            dfm_model, error = self._run_dfm_initializer(info, device)
+
+            # If the model failed to initialise on the GPU, retry once on CPU so
+            # face-swap still works (e.g. onnxruntime-gpu / CUDA version mismatch
+            # on Colab). Mirrors the detector's fallback above.
+            if error is not None and not device.is_cpu():
+                print(f'[Pipeline] Model load failed on GPU ({error}); retrying on CPU...')
+                with _device_lock:
+                    _device = _cpu_device
+                device = _cpu_device
+                with self._lock:
+                    self._model_load_progress = 0.0
+                dfm_model, error = self._run_dfm_initializer(info, device)
+
+            if dfm_model is not None:
+                where = 'CPU' if device.is_cpu() else f'GPU ({device})'
+                with self._lock:
+                    self._dfm_model = dfm_model
+                    self._current_model_name = model_name
+                    self._model_load_progress = 100.0
+                print(f'[Pipeline] Model "{model_name}" loaded on {where}.')
+            else:
+                with self._lock:
+                    self._model_load_error = error
+                print(f'[Pipeline] Model load error: {error}')
         except Exception as e:
             print(f'[Pipeline] Unexpected error loading model: {e}')
             with self._lock:
@@ -182,6 +187,28 @@ class FaceSwapPipeline:
         finally:
             with self._lock:
                 self._model_loading = False
+
+    def _run_dfm_initializer(self, info, device):
+        """Run a DFMModelInitializer to completion on the given device.
+
+        Returns (dfm_model, error) where exactly one is non-None. Handles the
+        download + init event loop and updates load progress along the way.
+        """
+        from modelhub.DFLive.DFMModel import DFMModelInitializer
+
+        initializer = DFMModelInitializer(info, device)
+        while True:
+            events = initializer.process_events()
+            if events.new_status_downloading or events.prev_status_downloading:
+                p = events.download_progress
+                if p is not None:
+                    with self._lock:
+                        self._model_load_progress = p
+            if events.new_status_initialized:
+                return events.dfm_model, None
+            if events.new_status_error:
+                return None, events.error
+            time.sleep(0.1)
 
     def get_model_status(self):
         with self._lock:
