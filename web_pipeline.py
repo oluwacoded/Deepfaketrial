@@ -224,6 +224,7 @@ class FaceSwapPipeline:
                 'error': self._model_load_error,
                 'mode': mode,
                 'target_face_set': has_target,
+                'device': 'cpu' if _device.is_cpu() else 'gpu',
             }
 
     # ------------------------------------------------------- target (paste)

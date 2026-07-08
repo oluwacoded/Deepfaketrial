@@ -337,6 +337,40 @@ input:checked + .toggle-slider::before { transform:translateX(17px); background:
       <div id="model-alert" class="alert alert-hidden"></div>
     </div>
 
+    <!-- ── Smooth on GPU (hardcoded Colab link + mode guide) ── -->
+    <div class="section" id="gpu-section">
+      <div class="section-title">⚡ Smooth celebrity mode (GPU)</div>
+
+      <!-- shown when running on CPU (e.g. the Replit link) -->
+      <div id="gpu-cpu-block">
+        <p style="font-size:.74rem;color:var(--muted);line-height:1.55;margin:-2px 0 8px">
+          This link runs on a <strong style="color:var(--warn)">CPU</strong>, so the celebrity
+          <strong>DFM</strong> model lags here. To use DFM <strong style="color:var(--success)">smoothly</strong>,
+          open the free <strong>GPU</strong> version (works great on your phone):
+        </p>
+        <a class="btn btn-primary" href="https://colab.research.google.com/github/oluwacoded/Deepfaketrial/blob/colab-gpu/deepfacelive_colab.ipynb" target="_blank" rel="noopener">🚀 Open GPU version (Colab)</a>
+        <ol style="font-size:.72rem;color:var(--muted);line-height:1.7;margin:8px 0 0;padding-left:18px">
+          <li>Tap the button, then <strong>Runtime → Change runtime type → T4 GPU → Save</strong>.</li>
+          <li>Run the 3 cells in order (tap ▶), wait ~2–3 min.</li>
+          <li>The last cell shows a <strong>QR code</strong> — scan it with your phone camera (or open the printed link).</li>
+          <li>Pick a celebrity model → <strong>Load Model</strong> → <strong>Start Camera</strong>. Smooth ✅</li>
+        </ol>
+      </div>
+
+      <!-- shown when already running on GPU (the Colab link) -->
+      <div id="gpu-on-block" style="display:none">
+        <div class="alert alert-success" style="margin-bottom:0">
+          ✅ <strong>You're on the GPU.</strong> The celebrity <strong>DFM</strong> model runs smooth here — pick a model below, tap <strong>Load Model</strong>, then <strong>Start Camera</strong>.
+        </div>
+      </div>
+
+      <div class="alert alert-info" style="margin-top:9px">
+        <strong>Which mode should I use?</strong><br>
+        🟢 <strong>Pick face from gallery</strong> (paste) — smooth on CPU. Pastes any photo's face onto you.<br>
+        🟣 <strong>DFM celebrity</strong> — truer, expression-tracked swap; smooth only on a GPU.
+      </div>
+    </div>
+
     <!-- ── Video Call (WebRTC) ── -->
     <div class="section">
       <div class="section-title">Love Call App 💜</div>
@@ -974,6 +1008,13 @@ function pollStatus() {
       showAlert($faceAlert, 'info', '✓ Custom face still active from last session.');
     }
     updateBanner();
+    // Device-aware GPU guidance (this page is served by both the CPU Replit app and the GPU Colab app)
+    if (s.device === 'gpu') {
+      const cpuB = document.getElementById('gpu-cpu-block');
+      const onB  = document.getElementById('gpu-on-block');
+      if (cpuB) cpuB.style.display = 'none';
+      if (onB)  onB.style.display  = 'block';
+    }
     if (s.loading) pollModelStatus();
   }).catch(() => {});
 }
