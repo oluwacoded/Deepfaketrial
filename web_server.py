@@ -34,6 +34,20 @@ from werkzeug.utils import secure_filename
 
 import auth
 import telegram_bot
+
+# --- GPU: make onnxruntime-gpu locate the CUDA/cuDNN shared objects that ship
+# in the pip nvidia-* packages. Without this, onnxruntime-gpu on Colab crashes
+# at import with "libcudnn.so.9 ... cannot open shared object file" instead of
+# using the GPU. preload_dlls() exists only in the GPU build (>=1.21), so this
+# is a harmless no-op on the CPU-only Replit host.
+try:
+    import onnxruntime as _ort
+    if hasattr(_ort, "preload_dlls"):
+        _ort.preload_dlls()
+        print("[gpu] onnxruntime CUDA/cuDNN libraries preloaded.")
+except Exception as _ort_e:  # never let GPU setup stop the server from booting
+    print("[gpu] onnxruntime preload skipped:", _ort_e)
+
 from web_pipeline import FaceSwapPipeline, MODELS_DIR
 
 app = Flask(__name__)
