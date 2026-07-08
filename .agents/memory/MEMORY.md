@@ -8,3 +8,4 @@
 - [DeepFaceLive silent CPU fallback](deepfacelive-colab-gpu.md) — "on GPU but laggy" often = ORT silently ran on CPU; trust sess.get_providers() not host guess; log_severity=4 hides the reason.
 - [DeepFaceLive publishing](deepfacelive-deployment.md) — always-on host (Replit VM/Railway) not autoscale; slim build via .replitignore; bind $PORT for Railway; CPU host = backend only, GPU stays on Colab.
 - [DeepFaceLive prod DB gating](deepfacelive-deployment.md) — dev & prod are separate DBs; run the code-bot only in the deployment, else codes land in dev DB and the live app says "invalid code".
+- [Eventlet greenlet I/O](eventlet-greenlet-io.md) — subprocess is green (ffmpeg ok in a greenlet); big file.save() yields mid-upload, so register shared state BEFORE the first yielding I/O to avoid janitor races.
