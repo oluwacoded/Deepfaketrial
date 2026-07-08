@@ -1,14 +1,23 @@
 """
 DeepFaceLive Web Pipeline
 Wraps the existing backend ML code for use in a headless web server.
-No Qt, no multiprocessing – single-threaded CPU inference.
+
+Threading model:
+  - Heavy inference runs in a worker thread (via eventlet.tpool in web_server),
+    so it never blocks the async event loop (that was the real cause of hangs).
+  - snapshot() grabs the current model refs under a lock in the caller's
+    (green) thread; run() then does pure CPU work with NO locks, making it
+    safe to execute in a native worker thread.
+
+Two swap modes:
+  - DFM   : celebrity .dfm models (face replacement)
+  - Paste : user-supplied photo, alpha-blended over the detected head
+Detection is rotation-augmented (0/90/-90) so it still works when the
+camera/user is sideways (e.g. lying down).
 """
-import base64
-import io
 import os
 import threading
 import time
-
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -28,26 +37,29 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 _cpu_device = lib_ort.get_cpu_device_info()
 
+# cv2 rotation constants for rotation-augmented detection
+_ROT = {90: cv2.ROTATE_90_CLOCKWISE, -90: cv2.ROTATE_90_COUNTERCLOCKWISE}
+_ROT_INV = {90: cv2.ROTATE_90_COUNTERCLOCKWISE, -90: cv2.ROTATE_90_CLOCKWISE}
+
 
 def _pick_device():
-    """Pick the best available inference device.
+    """Prefer a GPU execution provider if one is available, else CPU.
 
-    Auto-detects at runtime: on a GPU host (e.g. Google Colab with
-    onnxruntime-gpu installed) this returns the CUDA device so inference runs
-    fast; on a CPU-only host (e.g. Replit) it returns CPU unchanged. Set the
-    FORCE_CPU=1 environment variable to always use CPU.
+    Set FORCE_CPU=1 to always use CPU (handy for debugging on a GPU host).
     """
     if os.environ.get('FORCE_CPU') == '1':
-        print('[Pipeline] FORCE_CPU set - using CPU device.')
+        print('[Pipeline] FORCE_CPU set - using CPU inference.')
         return _cpu_device
     try:
-        for dev in lib_ort.get_available_devices_info(include_cpu=False):
-            if not dev.is_cpu():
-                print(f'[Pipeline] GPU detected - using {dev}')
-                return dev
+        devices = lib_ort.get_available_devices_info(include_cpu=False)
     except Exception as e:
-        print(f'[Pipeline] GPU detection failed ({e}); falling back to CPU.')
-    print('[Pipeline] No GPU detected - using CPU device.')
+        print(f'[Pipeline] GPU probe failed ({e}); using CPU.')
+        devices = []
+    if devices:
+        dev = devices[0]
+        print(f'[Pipeline] Using GPU device: {dev}')
+        return dev
+    print('[Pipeline] No GPU found; using CPU inference.')
     return _cpu_device
 
 
@@ -56,37 +68,34 @@ _device_lock = threading.Lock()
 
 
 class FaceSwapPipeline:
-    """
-    Simplified, single-threaded DeepFaceLive pipeline for web use.
-    Detection: YoloV5Face (bundled ONNX, no download needed)
-    Swap:      DFMModel (.dfm celebrity models)
-    """
-
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._detector: Optional[YoloV5Face] = None
         self._dfm_model: Optional[DFMModel] = None
         self._current_model_name: Optional[str] = None
         self._model_loading = False
-        self._model_load_progress: float = 0.0  # 0–100
+        self._model_load_progress: float = 0.0
         self._model_load_error: Optional[str] = None
         self._enabled = True
 
-        # Merge params (match FaceMerger defaults)
-        self.face_coverage = 2.2
-        self.face_output_size = 192
+        # Custom target face (paste mode) — BGR crop of the uploaded face+head
+        self._target_face_bgr: Optional[np.ndarray] = None
+
+        # Rotation the last successful detection used — try it first next frame
+        self._preferred_rot = 0
+
+        # Merge params
+        self.face_coverage = 2.0      # matches model training; wider washes out
+        self.face_output_size = 224   # match model input res (avoid lossy double-resize)
         self.morph_factor = 0.75
         self.face_opacity = 1.0
-        self.erode_amount = 5
-        self.blur_amount = 25
-        self.color_transfer = 'rct'  # 'rct' or 'none'
+        self.erode_amount = 4
+        self.blur_amount = 35
+        self.color_transfer = 'rct'   # 'rct' or 'none'
 
         self._init_detector()
 
-    # ------------------------------------------------------------------
-    # Detector initialisation
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------ setup
     def _init_detector(self):
         global _device
         try:
@@ -94,9 +103,12 @@ class FaceSwapPipeline:
             where = 'CPU' if _device.is_cpu() else f'GPU ({_device})'
             print(f'[Pipeline] YoloV5Face detector ready on {where}.')
         except Exception as e:
-            print(f'[Pipeline] Detector init failed on {_device}: {e}')
+            print(f'[Pipeline] Failed to init detector on {_device}: {e}')
+            # A GPU can be detected yet still fail to initialise (e.g.
+            # onnxruntime-gpu / cuDNN mismatch on Colab). Fall back to CPU so
+            # the app keeps working instead of having no detector at all.
             if not _device.is_cpu():
-                print('[Pipeline] Falling back to CPU...')
+                print('[Pipeline] Falling back to CPU for detection...')
                 with _device_lock:
                     _device = _cpu_device
                 try:
@@ -105,76 +117,84 @@ class FaceSwapPipeline:
                 except Exception as e2:
                     print(f'[Pipeline] CPU fallback also failed: {e2}')
 
-    # ------------------------------------------------------------------
-    # Model catalogue
-    # ------------------------------------------------------------------
-
+    # -------------------------------------------------------------- catalogue
     @staticmethod
     def get_available_models():
         infos = get_available_models_info(MODELS_DIR)
-        result = []
-        for info in infos:
-            result.append({
-                'name': info.get_name(),
-                'downloaded': info.get_model_path().exists(),
-                'has_url': info.get_url() is not None,
-            })
-        return result
+        return [{'name': i.get_name(),
+                 'downloaded': i.get_model_path().exists(),
+                 'has_url': i.get_url() is not None,
+                 'custom': i.get_url() is None} for i in infos]
 
-    # ------------------------------------------------------------------
-    # Model loading (with optional download)
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------ model load
     def load_model(self, model_name: str):
-        """Start loading a model in a background thread."""
         with self._lock:
             if self._model_loading:
                 return
             self._model_loading = True
             self._model_load_progress = 0.0
             self._model_load_error = None
-
         threading.Thread(target=self._load_model_thread,
                          args=(model_name,), daemon=True).start()
 
+    def _init_dfm(self, info, device):
+        """Drive a DFMModelInitializer to completion on `device`.
+        Returns (dfm_model, error_str); updates download progress as it runs.
+        Bails out if the load makes no forward progress for STALL_TIMEOUT
+        seconds, so a dead download can't leave the model stuck 'loading'."""
+        from modelhub.DFLive.DFMModel import DFMModelInitializer
+        STALL_TIMEOUT = 300.0
+        initializer = DFMModelInitializer(info, device)
+        last_change = time.monotonic()
+        last_progress = -1.0
+        while True:
+            events = initializer.process_events()
+            # Update progress on ANY reported value (not only on status flips):
+            # steady DOWNLOADING events carry download_progress too.
+            p = getattr(events, 'download_progress', None)
+            if p is not None:
+                with self._lock:
+                    self._model_load_progress = p
+                if p != last_progress:
+                    last_progress = p
+                    last_change = time.monotonic()
+            if events.new_status_initialized:
+                return events.dfm_model, None
+            if events.new_status_error:
+                return None, events.error
+            if time.monotonic() - last_change > STALL_TIMEOUT:
+                return None, ('Model load stalled (no progress). '
+                              'Check the connection and try again.')
+            time.sleep(0.1)
+
     def _load_model_thread(self, model_name: str):
         from modelhub.DFLive.DFMModel import get_available_models_info
-
+        with _device_lock:
+            device = _device  # snapshot once so a concurrent device swap can't split this load
         try:
             infos = get_available_models_info(MODELS_DIR)
-            info: Optional[DFMModelInfo] = None
-            for i in infos:
-                if i.get_name() == model_name:
-                    info = i
-                    break
-
+            info = next((i for i in infos if i.get_name() == model_name), None)
             if info is None:
                 with self._lock:
                     self._model_load_error = f'Model "{model_name}" not found.'
                 return
 
-            device = _device
-            dfm_model, error = self._run_dfm_initializer(info, device)
-
-            # If the model failed to initialise on the GPU, retry this one load on
-            # CPU so face-swap still works (e.g. onnxruntime-gpu / CUDA mismatch on
-            # Colab). We do NOT permanently demote the global device here: a
-            # transient download/model error must not force later loads onto CPU,
-            # and a truly broken GPU is already caught by the detector at startup.
+            dfm_model, error = self._init_dfm(info, device)
+            # Retry this one load on CPU if it failed on the GPU (e.g.
+            # onnxruntime-gpu / CUDA mismatch). We do NOT demote the global
+            # device: a transient download error must not force later loads to CPU.
             if error is not None and not device.is_cpu():
                 print(f'[Pipeline] Model load failed on GPU ({error}); retrying on CPU...')
                 with self._lock:
                     self._model_load_progress = 0.0
-                device = _cpu_device
-                dfm_model, error = self._run_dfm_initializer(info, device)
+                dfm_model, error = self._init_dfm(info, _cpu_device)
 
             if dfm_model is not None:
-                where = 'CPU' if device.is_cpu() else f'GPU ({device})'
                 with self._lock:
                     self._dfm_model = dfm_model
                     self._current_model_name = model_name
                     self._model_load_progress = 100.0
-                print(f'[Pipeline] Model "{model_name}" loaded on {where}.')
+                print(f'[Pipeline] Model "{model_name}" loaded.')
             else:
                 with self._lock:
                     self._model_load_error = error
@@ -187,190 +207,312 @@ class FaceSwapPipeline:
             with self._lock:
                 self._model_loading = False
 
-    def _run_dfm_initializer(self, info, device):
-        """Run a DFMModelInitializer to completion on the given device.
-
-        Returns (dfm_model, error) where exactly one is non-None. Handles the
-        download + init event loop and updates load progress along the way.
-        """
-        from modelhub.DFLive.DFMModel import DFMModelInitializer
-
-        initializer = DFMModelInitializer(info, device)
-        while True:
-            events = initializer.process_events()
-            if events.new_status_downloading or events.prev_status_downloading:
-                p = events.download_progress
-                if p is not None:
-                    with self._lock:
-                        self._model_load_progress = p
-            if events.new_status_initialized:
-                return events.dfm_model, None
-            if events.new_status_error:
-                return None, events.error
-            time.sleep(0.1)
+    def unload_model(self):
+        with self._lock:
+            self._dfm_model = None
+            self._current_model_name = None
+            self._model_load_error = None
 
     def get_model_status(self):
         with self._lock:
+            has_target = self._target_face_bgr is not None
+            mode = 'paste' if has_target else ('dfm' if self._dfm_model else 'none')
             return {
                 'current': self._current_model_name,
                 'loading': self._model_loading,
                 'progress': self._model_load_progress,
                 'error': self._model_load_error,
+                'mode': mode,
+                'target_face_set': has_target,
             }
 
-    # ------------------------------------------------------------------
-    # Frame processing — returns (jpeg_bytes, face_found)
-    # ------------------------------------------------------------------
-
-    def process_frame(self, jpg_bytes: bytes) -> Tuple[bytes, bool]:
-        """
-        Accept raw JPEG bytes, run face-swap, return (result_jpeg, face_found).
-        face_found=False means no face was detected (or no model loaded).
-        """
-        # Decode
+    # ------------------------------------------------------- target (paste)
+    def set_target_face(self, jpg_bytes: bytes) -> dict:
         arr = np.frombuffer(jpg_bytes, np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR uint8 HWC
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {'ok': False, 'error': 'Could not decode image'}
 
-        if frame is None:
-            return jpg_bytes, False
-
-        # Clamp huge frames (memory / CPU exhaustion)
-        max_dim = 1280
-        h, w = frame.shape[:2]
-        if h > max_dim or w > max_dim:
-            scale = max_dim / max(h, w)
-            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        h, w = img.shape[:2]
+        if max(h, w) > 1280:
+            sc = 1280 / max(h, w)
+            img = cv2.resize(img, (int(w * sc), int(h * sc)))
+            h, w = img.shape[:2]
 
         with self._lock:
             detector = self._detector
-            dfm_model = self._dfm_model
-            enabled = self._enabled
+        if detector is None:
+            return {'ok': False, 'error': 'Detector not ready'}
 
-        if not enabled or detector is None or dfm_model is None:
-            return self._encode(frame), False
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        bright = self._clahe(img_rgb)
+        faces, rot = self._detect_any_rotation(detector, bright, self._preferred_rot, 0.20)
+        if not faces or not faces[0]:
+            return {'ok': True, 'face_found': False}
+
+        work = cv2.rotate(img, _ROT[rot]) if rot in _ROT else img
+        Wr = work.shape[1]; Hr = work.shape[0]
+        dets = sorted(faces[0], key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+        l, t, r, b = [int(x) for x in dets[0]]
+        fw, fh = r - l, b - t
+        # generous padding — include forehead + hair (head + hair)
+        l = max(0, l - int(fw * 0.35)); r = min(Wr, r + int(fw * 0.35))
+        t = max(0, t - int(fh * 0.55)); b = min(Hr, b + int(fh * 0.35))
+
+        with self._lock:
+            self._target_face_bgr = work[t:b, l:r].copy()
+        print(f'[Pipeline] Target face set: {r-l}x{b-t}px')
+        return {'ok': True, 'face_found': True}
+
+    def clear_target_face(self):
+        with self._lock:
+            self._target_face_bgr = None
+        print('[Pipeline] Target face cleared.')
+
+    # --------------------------------------------------------- snapshot/run
+    def snapshot(self) -> dict:
+        """Grab current model refs under lock (call from the green thread)."""
+        with self._lock:
+            tf = self._target_face_bgr.copy() if self._target_face_bgr is not None else None
+            return {
+                'detector': self._detector,
+                'dfm_model': self._dfm_model,
+                'target_face': tf,
+                'enabled': self._enabled,
+                # snapshot ALL tuning params too, so run() reads nothing off
+                # self in the worker thread (deterministic per frame)
+                'preferred_rot': self._preferred_rot,
+                'face_coverage': self.face_coverage,
+                'face_output_size': self.face_output_size,
+                'morph_factor': self.morph_factor,
+                'face_opacity': self.face_opacity,
+                'color_transfer': self.color_transfer,
+                'erode_amount': self.erode_amount,
+                'blur_amount': self.blur_amount,
+            }
+
+    def process_frame(self, jpg_bytes: bytes) -> Tuple[bytes, bool, str]:
+        """Convenience: snapshot + run inline (used off the hot path)."""
+        return self.run(jpg_bytes, self.snapshot())
+
+    def run(self, jpg_bytes: bytes, snap: dict) -> Tuple[bytes, bool, str]:
+        """Pure CPU work — NO locks. Safe to run in a worker thread."""
+        arr = np.frombuffer(jpg_bytes, np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jpg_bytes, False, 'none'
+
+        h, w = frame.shape[:2]
+        if max(h, w) > 1280:
+            sc = 1280 / max(h, w)
+            frame = cv2.resize(frame, (int(w * sc), int(h * sc)))
+
+        detector = snap['detector']
+        dfm_model = snap['dfm_model']
+        target_face = snap['target_face']
+        enabled = snap['enabled']
+
+        if not enabled or detector is None:
+            return self._encode(frame), False, 'none'
 
         try:
-            result, face_found = self._swap_faces(frame, detector, dfm_model)
+            if target_face is not None:
+                result, found, rot = self._paste_face(frame, detector, target_face, snap)
+                if found:
+                    self._preferred_rot = rot   # atomic int write — a hint for next frame
+                return self._encode(result), found, 'paste'
+            if dfm_model is not None:
+                result, found, rot = self._dfm_swap(frame, detector, dfm_model, snap)
+                if found:
+                    self._preferred_rot = rot
+                return self._encode(result), found, 'dfm'
+            return self._encode(frame), False, 'none'
         except Exception as e:
-            print(f'[Pipeline] process_frame error: {e}')
+            print(f'[Pipeline] run error: {e}')
             import traceback; traceback.print_exc()
-            result, face_found = frame, False
+            return self._encode(frame), False, 'none'
 
-        return self._encode(result), face_found
+    # -------------------------------------------------------- detection util
+    @staticmethod
+    def _clahe(img_rgb: np.ndarray) -> np.ndarray:
+        """Boost dark frames so detection works in poor lighting."""
+        lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+        l_mean = float(lab[:, :, 0].mean())
+        if l_mean >= 100:
+            return img_rgb
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+        if l_mean < 70:
+            boost = min(150 / max(l_mean, 1), 3.0)
+            lab[:, :, 0] = np.clip(lab[:, :, 0].astype(np.float32) * boost, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    def _swap_faces(self, frame_bgr, detector, dfm_model) -> Tuple[np.ndarray, bool]:
-        """Run detection → align → swap → merge for one frame."""
-        H, W = frame_bgr.shape[:2]
+    def _detect_any_rotation(self, detector, frame_rgb_bright, preferred_rot=0, threshold=0.20):
+        """Try detection at [preferred, 0, 90, -90]; return (faces, rot).
+        Stateless: the caller persists the winning rotation, so worker threads
+        never write shared state here."""
+        h, w = frame_rgb_bright.shape[:2]
+        # Detection window scales with the frame: small live frames (~320px)
+        # detect at 384 instead of 640 -> far less CPU per frame at the same
+        # accuracy for the large faces typical on a webcam. Photos (up to
+        # 1280px) still use the full 640 window so small faces aren't missed.
+        fw = int(np.clip((max(h, w) // 32) * 32, 384, 640))
+        order = [preferred_rot]
+        for r in (0, 90, -90):
+            if r not in order:
+                order.append(r)
+        for rot in order:
+            img = frame_rgb_bright if rot == 0 else cv2.rotate(frame_rgb_bright, _ROT[rot])
+            faces = detector.extract(img, threshold=threshold, fixed_window=fw)
+            if faces and faces[0]:
+                return faces, rot
+        return None, 0
 
-        # Convert to RGB for processing (models expect RGB)
+    # -------------------------------------------------------------- DFM swap
+    def _dfm_swap(self, frame_bgr, detector, dfm_model, snap) -> Tuple[np.ndarray, bool, int]:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        bright = self._clahe(frame_rgb)
+        faces, rot = self._detect_any_rotation(detector, bright, snap['preferred_rot'], 0.20)
+        if not faces or not faces[0]:
+            return frame_bgr, False, 0
 
-        # 1. Detect faces — lower threshold for dark / side-lit faces
-        faces_per_batch = detector.extract(
-            frame_rgb, threshold=0.25, fixed_window=640)
-        if not faces_per_batch or not faces_per_batch[0]:
-            return frame_bgr, False
+        work_rgb = cv2.rotate(frame_rgb, _ROT[rot]) if rot in _ROT else frame_rgb
+        H, W = work_rgb.shape[:2]
 
-        # Process first detected face only (largest)
-        detections = faces_per_batch[0]
-        detections = sorted(detections, key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
-        l, t, r, b = detections[0]
-
-        # 2. Build FRect (uniform coordinates)
+        dets = sorted(faces[0], key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+        l, t, r, b = dets[0]
         face_rect = FRect.from_ltrb((l / W, t / H, r / W, b / H))
 
-        # 3. Cut & align the face
         face_align_img, uni_mat = face_rect.cut(
-            frame_rgb,
-            coverage=self.face_coverage,
-            output_size=self.face_output_size,
-        )
+            work_rgb, coverage=snap['face_coverage'], output_size=snap['face_output_size'])
         face_h, face_w = face_align_img.shape[:2]
 
-        # 4. DFM swap
         out_celeb, out_celeb_mask, out_face_mask = dfm_model.convert(
-            face_align_img, morph_factor=self.morph_factor)
+            face_align_img, morph_factor=snap['morph_factor'])
+        celeb_img = out_celeb[0]; celeb_mask = out_celeb_mask[0]; face_mask = out_face_mask[0]
 
-        # Outputs are NHWC; squeeze batch dim
-        celeb_img  = out_celeb[0]       # HWC float32
-        celeb_mask = out_celeb_mask[0]  # HW1 float32
-        face_mask  = out_face_mask[0]   # HW1 float32
+        aligned_to_source = uni_mat.invert().to_exact_mat(face_w, face_h, W, H)
+        merged = self._merge_cpu(work_rgb, face_align_img, celeb_img, celeb_mask,
+                                 face_mask, aligned_to_source, W, H, face_w, face_h, snap)
 
-        # 5. Build inverse transform: aligned → source frame
-        aligned_to_source = uni_mat.invert().to_exact_mat(
-            face_w, face_h, W, H)
-
-        # 6. Merge back onto the frame
-        merged = self._merge_cpu(
-            frame_rgb,
-            face_align_img,
-            celeb_img,
-            celeb_mask,
-            face_mask,
-            aligned_to_source,
-            W, H, face_w, face_h,
-        )
-
-        # Convert result float32 HWC [0,1] → uint8 → BGR
-        merged_uint8 = np.clip(merged * 255.0, 0, 255).astype(np.uint8)
-        return cv2.cvtColor(merged_uint8, cv2.COLOR_RGB2BGR), True
+        result = cv2.cvtColor(np.clip(merged * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        if rot in _ROT_INV:
+            result = cv2.rotate(result, _ROT_INV[rot])
+        return result, True, rot
 
     def _merge_cpu(self, frame_rgb, face_align_img, celeb_img, celeb_mask,
-                   face_mask, aligned_to_source_mat, W, H, face_w, face_h):
-        """
-        Pure-numpy / ImageProcessor merge (mirrors FaceMerger._merge_on_cpu).
-        All images are float32 in [0,1] range unless stated.
-        """
+                   face_mask, aligned_to_source_mat, W, H, face_w, face_h, snap):
         import numexpr as ne
-
         frame_f = ImageProcessor(frame_rgb).to_ufloat32().get_image('HWC')
 
-        # Build combined mask (face_mask * celeb_mask)
         fm = ImageProcessor(face_mask).to_ufloat32().get_image('HW')
         cm = ImageProcessor(celeb_mask).to_ufloat32().get_image('HW')
-        combined_mask = fm * cm  # HW
+        combined_mask = fm * cm
 
-        # Erode & blur the mask, fade to border
-        combined_mask_ip = ImageProcessor(combined_mask).erode_blur(
-            self.erode_amount, self.blur_amount, fade_to_border=True)
-        combined_mask_hwc = combined_mask_ip.get_image('HWC')  # HW1 float32
+        combined_mask_hwc = ImageProcessor(combined_mask).erode_blur(
+            snap['erode_amount'], snap['blur_amount'], fade_to_border=True).get_image('HWC')
 
-        # Color-match celeb face to source face tone
-        celeb_ip = ImageProcessor(celeb_img).to_ufloat32()
-        if self.color_transfer == 'rct':
+        if snap['color_transfer'] == 'rct':
+            celeb_f = ImageProcessor(celeb_img).to_ufloat32().get_image('HWC')
             face_align_f = ImageProcessor(face_align_img).to_ufloat32().get_image('HWC')
-            celeb_ip = celeb_ip.rct(
-                like=face_align_f,
-                mask=combined_mask_hwc,
-                like_mask=combined_mask_hwc,
-            )
+            celeb_f = self._robust_color_match(celeb_f, face_align_f, combined_mask)
+            celeb_ip = ImageProcessor(celeb_f)
+        else:
+            celeb_ip = ImageProcessor(celeb_img).to_ufloat32()
 
-        # Warp mask and celeb face back to frame space
         frame_mask = ImageProcessor(combined_mask_hwc).warp_affine(
-            aligned_to_source_mat, W, H
-        ).clip2(1.0 / 255.0, 0.0, 1.0, 1.0).get_image('HWC')
-
+            aligned_to_source_mat, W, H).clip2(1.0 / 255.0, 0.0, 1.0, 1.0).get_image('HWC')
         frame_celeb = celeb_ip.warp_affine(
             aligned_to_source_mat, W, H,
-            interpolation=ImageProcessor.Interpolation.LINEAR,
-        ).get_image('HWC')
+            interpolation=ImageProcessor.Interpolation.LINEAR).get_image('HWC')
 
-        # Blend
-        opacity = np.float32(self.face_opacity)
-        one_f = np.float32(1.0)
+        opacity = np.float32(snap['face_opacity']); one_f = np.float32(1.0)
         if opacity == 1.0:
-            merged = ne.evaluate(
-                'frame_f*(one_f-frame_mask) + frame_celeb*frame_mask')
+            merged = ne.evaluate('frame_f*(one_f-frame_mask) + frame_celeb*frame_mask')
         else:
-            merged = ne.evaluate(
-                'frame_f*(one_f-frame_mask) + frame_f*frame_mask*(one_f-opacity) + frame_celeb*frame_mask*opacity')
+            merged = ne.evaluate('frame_f*(one_f-frame_mask) + frame_f*frame_mask*(one_f-opacity) + frame_celeb*frame_mask*opacity')
+        return merged
 
-        return merged  # HWC float32
+    @staticmethod
+    def _robust_color_match(src_rgb01, ref_rgb01, mask_hw, lo=0.95, hi=1.15):
+        """Match the swapped face's color to the underlying face, robustly.
+        Full mean match (kills the model's cold/blue cast) and a per-channel
+        std ratio clamped tight around 1.0 — this is mean-dominant transfer:
+        it keeps the model's natural facial contrast (a wide clamp flattens
+        skin to a dull ashy grey, especially light models on dark subjects)
+        while the tight upper bound still stops bright pixels from blowing out
+        to glowing orange. Computed only over the face mask so the background
+        never skews the statistics."""
+        m = mask_hw > 0.3
+        if int(m.sum()) < 50:
+            return src_rgb01
+        src8 = np.clip(src_rgb01 * 255.0, 0, 255).astype(np.uint8)
+        ref8 = np.clip(ref_rgb01 * 255.0, 0, 255).astype(np.uint8)
+        src_lab = cv2.cvtColor(src8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        ref_lab = cv2.cvtColor(ref8, cv2.COLOR_RGB2LAB).astype(np.float32)
+        out = src_lab.copy()
+        for i in range(3):
+            s = src_lab[:, :, i][m]; r = ref_lab[:, :, i][m]
+            sm, ss = float(s.mean()), float(s.std()) + 1e-5
+            rm, rs = float(r.mean()), float(r.std()) + 1e-5
+            ratio = min(hi, max(lo, rs / ss))
+            out[:, :, i] = (src_lab[:, :, i] - sm) * ratio + rm
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(out, cv2.COLOR_LAB2RGB).astype(np.float32) / 255.0
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------ paste mode
+    def _paste_face(self, frame_bgr, detector, target_face_bgr, snap) -> Tuple[np.ndarray, bool, int]:
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        bright = self._clahe(frame_rgb)
+        faces, rot = self._detect_any_rotation(detector, bright, snap['preferred_rot'], 0.20)
+        if not faces or not faces[0]:
+            return frame_bgr, False, 0
 
+        work = cv2.rotate(frame_bgr, _ROT[rot]) if rot in _ROT else frame_bgr
+        H, W = work.shape[:2]
+        dets = sorted(faces[0], key=lambda d: (d[2]-d[0])*(d[3]-d[1]), reverse=True)
+        l, t, r, b = [int(x) for x in dets[0]]
+
+        fw, fh = r - l, b - t
+        # include forehead + hair to match the head-sized target crop
+        l = max(0, l - int(fw * 0.35)); r = min(W, r + int(fw * 0.35))
+        t = max(0, t - int(fh * 0.55)); b = min(H, b + int(fh * 0.35))
+        fw, fh = r - l, b - t
+        if fw < 20 or fh < 20:
+            return frame_bgr, False, 0
+
+        target = cv2.resize(target_face_bgr, (fw, fh), interpolation=cv2.INTER_LANCZOS4)
+        roi = work[t:b, l:r]
+        target = self._match_color(target, roi)
+
+        # feathered elliptical mask (fast alpha-blend)
+        mask = np.zeros((fh, fw), np.uint8)
+        cv2.ellipse(mask, (fw // 2, fh // 2),
+                    (max(1, int(fw * 0.46)), max(1, int(fh * 0.48))), 0, 0, 360, 255, -1)
+        k = max(3, (min(fw, fh) // 5) | 1)
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+
+        alpha = mask[:, :, None].astype(np.float32) / 255.0
+        result = work.copy()
+        result[t:b, l:r] = np.clip(target.astype(np.float32) * alpha +
+                                   roi.astype(np.float32) * (1.0 - alpha), 0, 255).astype(np.uint8)
+        if rot in _ROT_INV:
+            result = cv2.rotate(result, _ROT_INV[rot])
+        return result, True, rot
+
+    @staticmethod
+    def _match_color(src_bgr: np.ndarray, ref_bgr: np.ndarray) -> np.ndarray:
+        if src_bgr.size == 0 or ref_bgr.size == 0:
+            return src_bgr
+        s = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        rref = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        for i in range(3):
+            sm, ss = s[:, :, i].mean(), s[:, :, i].std() + 1e-6
+            rm, rs = rref[:, :, i].mean(), rref[:, :, i].std() + 1e-6
+            s[:, :, i] = (s[:, :, i] - sm) * (rs / ss) + rm
+        return cv2.cvtColor(np.clip(s, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    # ---------------------------------------------------------------- helpers
     @staticmethod
     def _encode(img_bgr: np.ndarray, quality: int = 82) -> bytes:
         ok, buf = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
@@ -389,8 +531,8 @@ class FaceSwapPipeline:
     def set_color_transfer(self, v: str):
         self.color_transfer = v if v in ('rct', 'none') else 'rct'
 
-    def unload_model(self):
-        with self._lock:
-            self._dfm_model = None
-            self._current_model_name = None
-            self._model_load_error = None
+    def set_face_output_size(self, v):
+        try:
+            self.face_output_size = int(np.clip(int(v), 96, 320))
+        except (TypeError, ValueError):
+            pass
