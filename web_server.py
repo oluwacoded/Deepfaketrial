@@ -24,15 +24,31 @@ import uuid
 import cv2
 import numpy as np
 
-from flask import Flask, jsonify, render_template, request, send_file
+from datetime import timedelta
+
+from flask import (Flask, jsonify, redirect, render_template, request,
+                   send_file, session, url_for)
 from flask_socketio import SocketIO, emit, join_room
 from werkzeug.utils import secure_filename
 
+import auth
+import telegram_bot
 from web_pipeline import FaceSwapPipeline, MODELS_DIR
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SESSION_SECRET', 'deepfacelive-web')
+# Session cookies are signed with this key. When access gating is on (Replit
+# host with DATABASE_URL) a strong SESSION_SECRET is REQUIRED — a known fallback
+# would let anyone forge a "paid" session. On the open Colab clone (no gating)
+# a fallback is harmless.
+_secret = os.environ.get('SESSION_SECRET')
+if not _secret:
+    if auth.enabled():
+        raise RuntimeError('SESSION_SECRET is required when access-code gating '
+                           'is enabled (DATABASE_URL set); refusing insecure fallback.')
+    _secret = 'deepfacelive-open-clone'
+app.config['SECRET_KEY'] = _secret
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1 GB upload cap (DFM models can be large)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=366)
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='eventlet',
                     max_http_buffer_size=10 * 1024 * 1024)
 
@@ -40,6 +56,89 @@ ALLOWED_IMAGE_MIMES = {'image/jpeg', 'image/png', 'image/webp', 'image/gif'}
 ALLOWED_VIDEO_EXTS = {'.mp4', '.webm', '.avi', '.mov', '.mkv', '.m4v'}
 
 pipeline = FaceSwapPipeline()
+
+
+# -----------------------------------------------------------------------
+# Access gating (subscription codes) — ACTIVE ONLY when DATABASE_URL is set.
+# On the free Colab GPU clone there is no DB, so the app runs fully open and
+# the smooth-GPU path is never blocked. On the always-on Replit host the gate
+# is on: visitors must log in with a valid access code before using the swap.
+#
+# Public (no code needed): the landing/login pages, static assets, the socket
+# handshake, and the call *guest* surface (/call/<id> + /api/room/<id>) so the
+# person you're calling can always join a shared link.
+# -----------------------------------------------------------------------
+PAYMENT_INFO = {
+    'accounts': [
+        {'bank': 'Opay', 'number': '9132883869'},
+        {'bank': 'Moniepoint', 'number': '9132883869'},
+    ],
+    'whatsapp': '2349132883869',        # buyers send proof of payment here
+    'whatsapp_display': '0913 288 3869',
+}
+
+_PUBLIC_PREFIXES = ('/static/', '/call/', '/api/room/', '/socket.io')
+_PUBLIC_PATHS = {'/welcome', '/login', '/logout', '/favicon.ico'}
+
+
+def _session_valid():
+    try:
+        exp = session.get('access_exp')
+        return bool(exp) and float(exp) > time.time()
+    except Exception:
+        return False
+
+
+def _is_public(path):
+    return path in _PUBLIC_PATHS or path.startswith(_PUBLIC_PREFIXES)
+
+
+@app.before_request
+def _access_gate():
+    if not auth.enabled():
+        return  # no DB → run open (Colab / local dev)
+    if _is_public(request.path) or _session_valid():
+        return
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Access code required', 'auth': False}), 401
+    return redirect(url_for('welcome'))
+
+
+@app.route('/welcome')
+def welcome():
+    if auth.enabled() and _session_valid():
+        return redirect(url_for('index'))
+    return render_template('landing.html', tiers=auth.TIERS_LIST,
+                           pay=PAYMENT_INFO, error=None)
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    if not auth.enabled():
+        return redirect(url_for('index'))
+    code = (request.form.get('code') or '').strip()
+    res = auth.redeem(code)
+    if res.get('ok'):
+        exp = res['expires_at']
+        session.permanent = True
+        session['access_code'] = code.upper()
+        session['access_tier'] = res['tier']
+        session['access_exp'] = exp.timestamp() if hasattr(exp, 'timestamp') else float(exp)
+        return redirect(url_for('index'))
+    reasons = {
+        'invalid': 'That access code is not valid.',
+        'expired': 'That access code has expired.',
+        'revoked': 'That access code has been revoked.',
+        'empty': 'Please enter your access code.',
+    }
+    return render_template('landing.html', tiers=auth.TIERS_LIST, pay=PAYMENT_INFO,
+                           error=reasons.get(res.get('reason'), 'Could not log in.')), 401
+
+
+@app.route('/logout', methods=['GET', 'POST'])
+def logout():
+    session.clear()
+    return redirect(url_for('welcome'))
 
 
 def run_swap(jpg_bytes):
@@ -483,6 +582,9 @@ def handle_frame(data):
     clients, {image: <base64 JPEG>}. Reply frame_result {image: <binary JPEG>,
     face_found, mode}. Binary drops the ~33% base64 tax in BOTH directions and
     the sync encode/decode that bloated the mobile round-trip."""
+    if auth.enabled() and not _session_valid():
+        emit('frame_error', {'message': 'Session expired — please log in again.', 'auth': False})
+        return
     try:
         if isinstance(data, (bytes, bytearray)):
             jpg_bytes = bytes(data)
@@ -518,5 +620,20 @@ def on_disconnect():
 # -----------------------------------------------------------------------
 
 if __name__ == '__main__':
+    if auth.enabled():
+        try:
+            auth.init_db()
+            print('[Auth] Access-code gating ENABLED (DATABASE_URL present).')
+        except Exception as e:  # noqa: BLE001
+            print(f'[Auth] init_db failed: {e}')
+        if telegram_bot.enabled():
+            eventlet.spawn(telegram_bot.run)
+            print('[Bot] Telegram code bot started.')
+        else:
+            print('[Bot] Telegram bot idle — set TELEGRAM_BOT_TOKEN + '
+                  'BOT_ADMIN_PASSPHRASE to enable code generation.')
+    else:
+        print('[Auth] No DATABASE_URL — running OPEN, no access gate '
+              '(expected on the Colab GPU clone).')
     print('Starting DeepFaceLive Web on http://0.0.0.0:5000')
     socketio.run(app, host='0.0.0.0', port=5000, debug=False)

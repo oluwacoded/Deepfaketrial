@@ -1,4 +1,4 @@
-modules = ["python-3.12"]
+modules = ["python-3.12", "postgresql-16"]
 [agent]
 expertMode = true
 
@@ -29,3 +29,7 @@ outputType = "webview"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[nix]
+channel = "stable-25_05"
+packages = ["abseil-cpp", "gtest", "hdf5", "iana-etc", "oneDNN", "openssh", "pkg-config", "re2"]

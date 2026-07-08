@@ -7,3 +7,6 @@ numexpr>=2.8
 h5py>=3.8
 onnx>=1.14
 eventlet>=0.33
+opencv-python
+pg8000
+werkzeug
