@@ -9,3 +9,5 @@
 - [DeepFaceLive publishing](deepfacelive-deployment.md) — always-on host (Replit VM/Railway) not autoscale; slim build via .replitignore; bind $PORT for Railway; CPU host = backend only, GPU stays on Colab.
 - [DeepFaceLive prod DB gating](deepfacelive-deployment.md) — dev & prod are separate DBs; run the code-bot only in the deployment, else codes land in dev DB and the live app says "invalid code".
 - [Eventlet greenlet I/O](eventlet-greenlet-io.md) — subprocess is green (ffmpeg ok in a greenlet); big file.save() yields mid-upload, so register shared state BEFORE the first yielding I/O to avoid janitor races.
+- [DeepFaceLive remote FPS ceiling](deepfacelive-colab-gpu.md) — even genuinely on GPU, phone→tunnel→Colab→back RTT (~450ms) caps live FPS ~2-3; lag is the round trip, not compute — don't code-optimize it, only a local GPU fixes it.
+- [DeepFaceLive call-room lifecycle](deepfacelive-call-rooms.md) — mobile drops the caller socket to share the link; never drop rooms on disconnect; persist answer + buffer ICE + rejoin; route ICE by role not by sid.

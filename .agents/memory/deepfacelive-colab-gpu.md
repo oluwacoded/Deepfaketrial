@@ -108,3 +108,14 @@ it to 2 (warning) so the cause (CUDA/cuDNN mismatch, missing lib) shows in the C
 console; keep CPU sessions quiet at 4.
 **Why:** it's a debugging trap — the swap still "works" and the banner says GPU, so you
 chase the wrong thing. Trust get_providers(), not intent.
+
+## Even genuinely on GPU, live FPS is capped by the remote round-trip
+When the user is truly on CUDA (get_providers() confirms) and STILL says "laggy," the
+ceiling is the NETWORK, not compute. Every frame round-trips phone → Cloudflare quick
+tunnel → Colab → back (~450ms RTT observed); the client send loop and the server pipeline
+are both serial, so throughput ≈ 1/RTT ≈ 2-3 fps no matter how fast convert() is (~15ms on
+T4). This CANNOT be coded away at this architecture — pipelining does not beat the RTT floor
+when frames are sent serially and awaited. Truly smooth (real-time) needs a LOCAL GPU (no
+per-frame WAN hop). Set this expectation honestly instead of chasing pipeline micro-opts.
+**Distinct from "silently on CPU":** that trap is when it's NOT actually on GPU; this is
+when it IS on GPU and the WAN hop dominates. Check get_providers() first to tell them apart.
