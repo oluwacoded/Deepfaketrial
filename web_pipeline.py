@@ -93,6 +93,9 @@ class FaceSwapPipeline:
         # silently run on CPU even on a GPU host, so we record the real answer.
         self._detector_on_gpu: Optional[bool] = None
         self._model_on_gpu: Optional[bool] = None
+        # Rate-limited swap heartbeat counters (for diagnosing remote runs)
+        self._frame_log_n = 0
+        self._frame_swapped = 0
 
         # Custom target face (paste mode) — BGR crop of the uploaded face+head
         self._target_face_bgr: Optional[np.ndarray] = None
@@ -360,22 +363,43 @@ class FaceSwapPipeline:
         if not enabled or detector is None:
             return self._encode(frame), False, 'none'
 
+        found, mode = False, 'none'
         try:
             if target_face is not None:
                 result, found, rot = self._paste_face(frame, detector, target_face, snap)
+                mode = 'paste'
                 if found:
                     self._preferred_rot = rot   # atomic int write — a hint for next frame
-                return self._encode(result), found, 'paste'
-            if dfm_model is not None:
+                out = self._encode(result)
+            elif dfm_model is not None:
                 result, found, rot = self._dfm_swap(frame, detector, dfm_model, snap)
+                mode = 'dfm'
                 if found:
                     self._preferred_rot = rot
-                return self._encode(result), found, 'dfm'
-            return self._encode(frame), False, 'none'
+                out = self._encode(result)
+            else:
+                out = self._encode(frame)
         except Exception as e:
             print(f'[Pipeline] run error: {e}')
             import traceback; traceback.print_exc()
-            return self._encode(frame), False, 'none'
+            out, found, mode = self._encode(frame), False, 'none'
+        self._log_frame_stats(found, mode)
+        return out, found, mode
+
+    def _log_frame_stats(self, found: bool, mode: str):
+        """Rate-limited heartbeat so a remote (Colab) run explains itself in its
+        own console: if `swapped` stays 0 while `passthrough` climbs, the model
+        pipeline is running but no face is being detected (check detector_gpu);
+        any convert errors are printed above by run()."""
+        n = self._frame_log_n + 1
+        self._frame_log_n = n
+        if found:
+            self._frame_swapped += 1
+        if n % 50 == 0:
+            swapped = self._frame_swapped
+            print(f'[Pipeline] frames={n} swapped={swapped} passthrough={n - swapped} '
+                  f'last_mode={mode} detector_gpu={self._detector_on_gpu} '
+                  f'model_gpu={self._model_on_gpu}')
 
     # -------------------------------------------------------- detection util
     @staticmethod

@@ -479,6 +479,10 @@ socket.on('connect', () => {
   $dot.classList.add('on');
   document.getElementById('conn-label').textContent = 'Connected';
   pollStatus();
+  // If a call was live when the socket dropped (e.g. we left the tab to share
+  // the link, or the phone locked), re-attach to the room so the callee can
+  // still reach us instead of seeing "link expired".
+  if (callRoomId && rtcConn) socket.emit('rejoin_call', { room_id: callRoomId });
 });
 socket.on('disconnect', () => {
   $dot.classList.remove('on');

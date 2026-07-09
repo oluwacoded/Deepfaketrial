@@ -80,6 +80,7 @@ const $video = document.getElementById('remote-video');
 const $status = document.getElementById('status');
 
 let rtcConn = null;
+let connecting = false;
 
 function setStatus(icon, h, p) {
   $icon.textContent = icon;
@@ -97,9 +98,13 @@ socket.on('connect', async () => {
 socket.on('disconnect', () => {
   $cdot.classList.remove('on');
   $txt.textContent = 'Disconnected';
-  setStatus('📵', 'Call ended', 'The connection was lost.');
+  setStatus('📵', 'Reconnecting…', 'Connection dropped — trying to restore the call.');
   $video.style.display = 'none';
   $status.style.display = 'block';
+  // Tear down so the next 'connect' re-negotiates from scratch instead of the
+  // duplicate-guard short-circuiting connect() forever.
+  if (rtcConn) { try { rtcConn.close(); } catch(e) {} rtcConn = null; }
+  connecting = false;
 });
 
 socket.on('webrtc_ice', async data => {
@@ -109,18 +114,26 @@ socket.on('webrtc_ice', async data => {
 });
 
 async function connect() {
-  // Fetch the offer stored by the caller
-  let offer;
-  try {
-    const res = await fetch(`/api/room/${roomId}`);
-    const d   = await res.json();
-    if (d.error) {
-      setStatus('❌', 'Call not found', 'This link may have expired. Ask the caller to start a new call.');
-      return;
+  if (rtcConn || connecting) return;   // don't start a second connection
+  connecting = true;
+  // Fetch the offer the caller stored. They may still be finishing setup or
+  // briefly offline while sharing the link, so retry a few times rather than
+  // flashing "expired" on the first miss.
+  let offer = null;
+  for (let attempt = 0; attempt < 6 && offer === null; attempt++) {
+    if (attempt > 0) {
+      setStatus('⏳', 'Connecting…', 'Waiting for the caller to be ready…');
+      await new Promise(r => setTimeout(r, 2000));
     }
-    offer = d.offer;
-  } catch(e) {
-    setStatus('❌', 'Network error', e.message);
+    try {
+      const res = await fetch(`/api/room/${roomId}`);
+      const d   = await res.json();
+      if (d.offer) offer = d.offer;
+    } catch(e) { /* transient network — retry */ }
+  }
+  connecting = false;
+  if (offer === null) {
+    setStatus('❌', 'Call not found', 'This link may have expired. Ask the caller to start a new call.');
     return;
   }
 

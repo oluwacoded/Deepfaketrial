@@ -440,7 +440,9 @@ def on_webrtc_offer(data):
         emit('call_error', {'message': 'Server is busy — please try again shortly.'})
         return
     _rooms[room_id] = {'offer': offer, 'ts': time.time(),
-                       'caller_sid': request.sid, 'caller_ice': [], 'answered': False}
+                       'caller_sid': request.sid, 'callee_sid': None,
+                       'caller_ice': [], 'callee_ice': [],
+                       'answer': None, 'answered': False}
     join_room(room_id)
     emit('offer_stored', {'room_id': room_id})
     print(f'[Call] Offer stored for room {room_id} ({len(_rooms)} active)')
@@ -459,6 +461,8 @@ def on_webrtc_answer(data):
     join_room(room_id)                    # callee joins the room
     room['ts'] = time.time()
     room['answered'] = True
+    room['callee_sid'] = request.sid      # remember the callee so ICE can be routed by role
+    room['answer'] = answer               # keep it so a reconnecting caller can still receive it
     emit('webrtc_answer', {'answer': answer}, to=room_id, include_self=False)
     for cand in room['caller_ice']:       # flush buffered caller ICE to the callee
         emit('webrtc_ice', {'candidate': cand})
@@ -476,10 +480,18 @@ def on_webrtc_ice(data):
     room = _rooms.get(room_id)
     if not room:
         return
-    # buffer the caller's ICE until the callee joins, so none are dropped
-    if request.sid == room['caller_sid'] and not room['answered']:
+    # Route by role, robust to the caller's SID changing on reconnect. Before the
+    # callee answers, the only side that trickles ICE is the caller, so anything
+    # that arrives is caller ICE (buffered until the callee joins). After the
+    # answer, only a candidate from the known callee_sid is callee ICE; anything
+    # else is the caller (including its NEW sid before rejoin_call lands), so
+    # caller candidates can never be misfiled into the callee buffer and lost.
+    if not room['answered']:
         if len(room['caller_ice']) < _MAX_ICE_PER_ROOM:
             room['caller_ice'].append(candidate)
+    elif request.sid == room.get('callee_sid'):
+        if len(room['callee_ice']) < _MAX_ICE_PER_ROOM:
+            room['callee_ice'].append(candidate)
     emit('webrtc_ice', {'candidate': candidate}, to=room_id, include_self=False)
 
 
@@ -494,6 +506,30 @@ def on_end_call(data):
     if room and room['caller_sid'] == request.sid:
         _rooms.pop(room_id, None)
         print(f'[Call] Room {room_id} dropped (ended)')
+
+
+@socketio.on('rejoin_call')
+def on_rejoin_call(data):
+    """The caller's socket reconnected (e.g. it dropped while they left the tab
+    to share the link). Re-point the room at the new socket and replay anything
+    that arrived while it was gone, so the call can still complete."""
+    data = data or {}
+    room_id = data.get('room_id')
+    if not _valid_room_id(room_id):
+        return
+    _cleanup_rooms()
+    room = _rooms.get(room_id)
+    if not room:
+        emit('call_error', {'message': 'This call expired — please start a new one.'})
+        return
+    room['caller_sid'] = request.sid
+    room['ts'] = time.time()
+    join_room(room_id)
+    if room.get('answer'):                 # callee already answered while we were away
+        emit('webrtc_answer', {'answer': room['answer']})
+        for cand in room['callee_ice']:
+            emit('webrtc_ice', {'candidate': cand})
+    print(f'[Call] Caller re-joined room {room_id}')
 
 
 # -----------------------------------------------------------------------
@@ -820,7 +856,13 @@ def on_connect():
 
 @socketio.on('disconnect')
 def on_disconnect():
-    _drop_rooms_for_sid(request.sid)
+    # Deliberately do NOT drop the caller's room here. On a phone the caller's
+    # socket disconnects the moment they leave the browser tab to share the link
+    # (or the screen locks, or the tunnel hiccups) — dropping the room made the
+    # callee open the link to "expired". Rooms now live until their TTL, an
+    # explicit End Call, or the caller starting a new call; the caller re-attaches
+    # via 'rejoin_call' when its socket comes back.
+    _cleanup_rooms()          # opportunistic sweep of TTL-expired rooms only
     print(f'[WS] Client disconnected: {request.sid}')
 
 
